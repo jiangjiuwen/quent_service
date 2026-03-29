@@ -510,7 +510,7 @@ table {
 
 .dashboard {
   display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(300px, 0.78fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   margin-top: 14px;
 }
