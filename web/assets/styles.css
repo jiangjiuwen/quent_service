@@ -30,6 +30,7 @@ body {
   color: var(--ink);
   background: linear-gradient(180deg, #f8f3eb 0%, #efe8dc 100%);
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 button,
@@ -76,6 +77,12 @@ table {
   gap: 16px;
 }
 
+.topbar > *,
+.panel-header > *,
+.hero-side-header > * {
+  min-width: 0;
+}
+
 .topbar {
   margin-bottom: 16px;
 }
@@ -117,6 +124,7 @@ table {
 
 .brand h1 {
   font-size: 1.35rem;
+  overflow-wrap: anywhere;
 }
 
 .hero-grid {
@@ -135,6 +143,7 @@ table {
   font-size: clamp(1.68rem, 2.25vw, 2.75rem);
   line-height: 1.04;
   max-width: none;
+  overflow-wrap: anywhere;
 }
 
 .hero-text,
@@ -549,6 +558,7 @@ table {
   font-size: 1.54rem;
   color: #fff;
   text-shadow: 0 2px 6px rgba(17, 33, 42, 0.24);
+  overflow-wrap: anywhere;
 }
 
 .price-badge small {
@@ -617,6 +627,7 @@ table {
   line-height: 1.3;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .stat-tile small {
@@ -897,6 +908,7 @@ table {
   line-height: 1.35;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 
 .chart-empty,
@@ -988,6 +1000,7 @@ thead th {
 .watchlist-tail {
   color: var(--muted);
   font-size: 0.88rem;
+  overflow-wrap: anywhere;
 }
 
 .factor-score-total {
@@ -1042,6 +1055,7 @@ thead th {
   display: block;
   margin-top: 5px;
   font-size: 0.92rem;
+  overflow-wrap: anywhere;
 }
 
 .factor-grid {
@@ -1081,6 +1095,7 @@ thead th {
   margin: 6px 0 0;
   color: var(--muted);
   line-height: 1.38;
+  overflow-wrap: anywhere;
 }
 
 .signal-badge {
@@ -1224,6 +1239,7 @@ thead th {
   margin-top: 5px;
   font-size: 0.88rem;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .technical-chip-row {
@@ -1268,6 +1284,7 @@ thead th {
   margin: 5px 0 0;
   color: var(--muted);
   line-height: 1.36;
+  overflow-wrap: anywhere;
 }
 
 .market-up {
@@ -1306,6 +1323,33 @@ thead th {
   }
 }
 
+@media (max-width: 980px) {
+  .topbar,
+  .hero-side-header,
+  .chart-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .topbar-actions,
+  .chart-legend {
+    justify-content: flex-start;
+  }
+
+  .hero-side-status {
+    justify-content: stretch;
+  }
+
+  .hero-side-status-chip {
+    flex: 1 1 calc(50% - 10px);
+    min-width: 0;
+  }
+
+  .technical-panel .technical-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 720px) {
   .page-shell {
     padding: 12px;
@@ -1324,8 +1368,53 @@ thead th {
     align-items: stretch;
   }
 
+  .topbar-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    gap: 8px;
+  }
+
+  .topbar-actions .ghost-button,
+  .topbar-actions .primary-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .topbar-status {
+    grid-column: 1 / -1;
+    text-align: center;
+    white-space: normal;
+  }
+
   .search-form {
     grid-template-columns: 1fr;
+  }
+
+  .hero-copy h2 {
+    line-height: 1.08;
+  }
+
+  .hero-side-header,
+  .hero-side-section-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .hero-side-status {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .hero-side-status-chip {
+    width: 100%;
+  }
+
+  .hero-side-section-note {
+    white-space: normal;
   }
 
   .metric-grid,
@@ -1341,6 +1430,7 @@ thead th {
 
   .price-badge {
     min-width: 0;
+    width: 100%;
   }
 
   .chart-toolbar {
@@ -1357,12 +1447,43 @@ thead th {
   }
 
   .range-button {
-    flex: 1 1 calc(33.333% - 8px);
+    flex: 1 1 calc(50% - 8px);
     text-align: center;
+    min-height: 40px;
   }
 
-  #priceChart {
-    height: 360px;
+  .chart-wrap {
+    padding: 10px;
+    min-height: 332px;
+  }
+
+  #priceChart,
+  .chart-canvas {
+    height: 320px;
+    min-height: 320px;
+  }
+
+  .chart-attribution {
+    text-align: left;
+  }
+
+  .watchlist-head,
+  .watchlist-tail,
+  .factor-card-head,
+  .technical-hero-head,
+  .technical-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .signal-badge,
+  .technical-score {
+    align-self: flex-start;
+  }
+
+  .watchlist-tail {
+    gap: 4px;
   }
 
   th:nth-child(3),
@@ -1370,5 +1491,87 @@ thead th {
   th:nth-child(4),
   td:nth-child(4) {
     display: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .page-shell {
+    padding: 10px;
+  }
+
+  .hero,
+  .panel {
+    padding: 12px;
+    border-radius: 20px;
+  }
+
+  .brand {
+    gap: 10px;
+  }
+
+  .brand-mark {
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    font-size: 1.15rem;
+  }
+
+  .brand h1 {
+    font-size: 1.12rem;
+  }
+
+  .hero-copy h2 {
+    font-size: 1.52rem;
+  }
+
+  .hero-text,
+  .muted {
+    font-size: 0.92rem;
+  }
+
+  .primary-button,
+  .secondary-button,
+  .ghost-button {
+    min-height: 42px;
+  }
+
+  .search-box,
+  .meta-chip,
+  .metric-card-compact,
+  .stat-tile,
+  .chart-detail-card,
+  .financial-item,
+  .factor-card,
+  .technical-hero,
+  .technical-card,
+  .technical-plan-item,
+  .watchlist-item {
+    padding: 10px 11px;
+  }
+
+  .range-button {
+    padding: 8px 6px;
+    font-size: 0.9rem;
+  }
+
+  .legend-item {
+    font-size: 0.74rem;
+  }
+
+  .chart-wrap {
+    padding: 8px;
+    min-height: 300px;
+  }
+
+  #priceChart,
+  .chart-canvas {
+    height: 288px;
+    min-height: 288px;
+  }
+
+  .placeholder-card {
+    min-height: 118px;
+    padding: 12px;
+    text-align: center;
   }
 }
