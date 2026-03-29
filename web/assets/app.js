@@ -15,6 +15,7 @@ const api = {
   syncDaily: "/api/v1/sync/daily",
   analysisScorecard: "/api/v1/analysis/scorecard",
   analysisScoreDetail: (code) => `/api/v1/analysis/scorecard/${code}`,
+  analysisMarketOverview: "/api/v1/analysis/market-overview",
   analysisTechnicalDetail: (code) => `/api/v1/analysis/technical/${code}`,
   stockSearch: "/api/v1/stocks/search",
   stockInfo: (code) => `/api/v1/stocks/${code}`,
@@ -112,6 +113,25 @@ function formatCompact(value) {
     return String(value);
   }
   return compactNumberFormatter.format(num);
+}
+
+function formatMoneyFlow(value, digits = 2) {
+  if (value === null || value === undefined || value === "") {
+    return "--";
+  }
+  const num = Number(value);
+  if (Number.isNaN(num)) {
+    return String(value);
+  }
+  const sign = num > 0 ? "+" : "";
+  const absValue = Math.abs(num);
+  if (absValue >= 1e8) {
+    return `${sign}${formatMaybeNumber(num / 1e8, digits)}亿`;
+  }
+  if (absValue >= 1e4) {
+    return `${sign}${formatMaybeNumber(num / 1e4, digits)}万`;
+  }
+  return `${sign}${formatMaybeNumber(num, digits)}`;
 }
 
 function formatDateTime(value) {
@@ -1048,6 +1068,12 @@ function renderFactorScorecard(data, stockCode) {
     container.innerHTML = `<div class="placeholder-card">${stockCode} 暂无短线机会评分数据。</div>`;
     return;
   }
+  if (data.pending_refresh && !data.factors) {
+    const identity = escapeHtml(formatNamedCode(data.stock_name, data.stock_code || stockCode));
+    const tradeDate = data.trade_date || data.latest_market_trade_date || "--";
+    container.innerHTML = `<div class="placeholder-card">${identity} 的短线机会评分正在后台刷新。当前市场最新交易日为 ${tradeDate}，请稍后自动重试。</div>`;
+    return;
+  }
   updateAnalysisTitles(data.stock_name, data.stock_code || stockCode);
   const totalScoreTone = scoreToneClass(Number(data.total_score || 0), 8, 3);
   const tierTone = /优先交易|重点关注/.test(data.tier_label || "")
@@ -1135,6 +1161,7 @@ function renderFactorScorecard(data, stockCode) {
   ];
 
   container.innerHTML = `
+    ${data.pending_refresh ? `<p class="muted">评分卡正在后台刷新，当前先展示截至 ${escapeHtml(data.trade_date || "--")} 的缓存结果。</p>` : ""}
     <div class="factor-summary-grid">
       <div class="financial-item ${totalScoreTone}">
         <span>总分</span>
@@ -1398,6 +1425,11 @@ function renderObservationPool(data) {
   const container = $("watchlist");
   const items = data?.items || [];
   if (!items.length) {
+    if (data?.pending_refresh) {
+      const tradeDate = data?.latest_market_trade_date || data?.trade_date || "--";
+      container.innerHTML = `<div class="placeholder-card">短线机会评分正在后台刷新，当前市场最新交易日为 ${tradeDate}，请稍后自动更新。</div>`;
+      return;
+    }
     container.innerHTML = `<div class="placeholder-card">当前没有达到 ${data?.min_score ?? 6} 分的短线机会。</div>`;
     return;
   }
@@ -1440,6 +1472,187 @@ async function loadObservationPool() {
   }
 }
 
+function renderMarketOverview(data) {
+  const container = $("marketOverview");
+  if (!data) {
+    container.innerHTML = `<div class="placeholder-card">市场结构加载失败。</div>`;
+    return;
+  }
+
+  const sentiment = data.sentiment;
+  if (!sentiment) {
+    if (data.pending_refresh) {
+      const tradeDate = data.latest_market_trade_date || data.trade_date || "--";
+      container.innerHTML = `<div class="placeholder-card">市场结构正在后台刷新，当前市场最新交易日为 ${tradeDate}，请稍后自动更新。</div>`;
+      return;
+    }
+    container.innerHTML = `<div class="placeholder-card">暂无市场结构数据。</div>`;
+    return;
+  }
+
+  const sentimentTone = scoreToneClass(Number(sentiment.sentiment_score || 0), 60, 30);
+  const fundFlow = data.fund_flow?.market || null;
+  const fundFlowTone = Number(fundFlow?.main_net_inflow || 0) > 0
+    ? "positive"
+    : Number(fundFlow?.main_net_inflow || 0) < 0
+      ? "negative"
+      : "";
+  const leaders = data.events?.leaders || [];
+  const failedLimits = data.events?.failed_limits || [];
+  const benchmarks = data.benchmarks || [];
+  const sectors = data.sectors || [];
+  const fundIndustries = data.fund_flow?.industries || [];
+
+  const renderEventRows = (items, emptyText, toneResolver) =>
+    items.length
+      ? items
+          .map((item) => {
+            const tone = toneResolver(item);
+            const extraLabel = item.event_type === "failed_limit_up"
+              ? `回落 ${item.event_value === null || item.event_value === undefined ? "--" : formatDecimalPercent(Math.abs(item.event_value))}`
+              : `${item.consecutive_days >= 2 ? `${item.consecutive_days} 连板` : "首板"} / ${formatSignedPercent(item.pct_change)}`;
+            return `
+              <div class="overview-event-row">
+                <span>
+                  <strong>${escapeHtml(item.stock_name)}</strong>
+                  <small>${item.stock_code} · ${escapeHtml(item.sector_name || "--")}</small>
+                </span>
+                <span class="signal-badge ${tone}">${escapeHtml(item.event_label || "--")}</span>
+                <small>${escapeHtml(item.note || extraLabel)}</small>
+              </div>
+            `;
+          })
+          .join("")
+      : `<div class="placeholder-card overview-placeholder">${emptyText}</div>`;
+
+  container.innerHTML = `
+    ${data.pending_refresh ? `<p class="muted">市场结构正在后台刷新，当前先展示截至 ${escapeHtml(data.trade_date || "--")} 的缓存结果。</p>` : ""}
+    <div class="overview-summary-grid">
+      <div class="financial-item ${sentimentTone}">
+        <span>情绪温度</span>
+        <strong>${sentiment.sentiment_score} / 100 · ${escapeHtml(sentiment.sentiment_label || "--")}</strong>
+      </div>
+      <div class="financial-item ${Number(sentiment.rising_count || 0) >= Number(sentiment.falling_count || 0) ? "positive" : "negative"}">
+        <span>涨跌家数</span>
+        <strong>${numberFormatter.format(sentiment.rising_count || 0)} / ${numberFormatter.format(sentiment.falling_count || 0)}</strong>
+      </div>
+      <div class="financial-item ${Number(sentiment.limit_up_count || 0) >= Number(sentiment.failed_limit_count || 0) ? "positive" : "negative"}">
+        <span>涨停 / 炸板 / 跌停</span>
+        <strong>${numberFormatter.format(sentiment.limit_up_count || 0)} / ${numberFormatter.format(sentiment.failed_limit_count || 0)} / ${numberFormatter.format(sentiment.limit_down_count || 0)}</strong>
+      </div>
+      <div class="financial-item ${fundFlowTone}">
+        <span>主力净流入</span>
+        <strong>${formatMoneyFlow(fundFlow?.main_net_inflow)}${fundFlow?.main_net_inflow_ratio === null || fundFlow?.main_net_inflow_ratio === undefined ? "" : ` · ${formatSignedPercent(fundFlow.main_net_inflow_ratio)}`}</strong>
+      </div>
+    </div>
+    <article class="overview-note ${sentimentTone}">
+      <strong>${escapeHtml(sentiment.summary || "暂无市场结论。")}</strong>
+      <small>最新交易日 ${escapeHtml(data.trade_date || "--")} · 5日均值 ${formatMaybeNumber(sentiment.score_avg_5d, 1)} · 较前一日 ${formatSignedNumber(sentiment.score_change_1d, 0)}</small>
+    </article>
+    <div class="overview-grid">
+      <section class="overview-block">
+        <div class="overview-block-head">
+          <span>指数强弱</span>
+          <small>1日与5日表现</small>
+        </div>
+        <div class="overview-benchmark-grid">
+          ${benchmarks.length
+            ? benchmarks
+                .map(
+                  (item) => `
+                    <article class="overview-mini-card">
+                      <span>${escapeHtml(item.index_name || item.index_code)}</span>
+                      <strong class="${priceToneClass(item.pct_change)}">${formatSignedPercent(item.pct_change)}</strong>
+                      <small>5日 ${formatSignedDecimalPercent(item.return_5d)}</small>
+                    </article>
+                  `
+                )
+                .join("")
+            : `<div class="placeholder-card overview-placeholder">暂无指数强弱数据。</div>`}
+        </div>
+      </section>
+      <section class="overview-block">
+        <div class="overview-block-head">
+          <span>热点行业</span>
+          <small>强度 + 趋势 + 资金</small>
+        </div>
+        <div class="overview-sector-grid">
+          ${sectors.length
+            ? sectors
+                .map((item) => {
+                  const sectorTone = scoreToneClass(Number(item.strength_score || 0), 60, 35);
+                  const risingRatio = item.stock_count ? (Number(item.rising_count || 0) / Number(item.stock_count || 1)) * 100 : null;
+                  return `
+                    <article class="overview-sector-card ${sectorTone}">
+                      <div class="overview-sector-head">
+                        <span>${escapeHtml(item.sector_name || "--")}</span>
+                        <strong class="signal-badge ${sectorTone}">${item.strength_score}</strong>
+                      </div>
+                      <small>${formatSignedPercent(item.avg_pct_change)} · 5日 ${formatSignedDecimalPercent(item.avg_return_5d)} · 上方 ${formatDecimalPercent(item.above_ma20_ratio)}</small>
+                      <p>上涨 ${formatMaybeNumber(risingRatio, 0)}% / 涨停 ${numberFormatter.format(item.limit_up_count || 0)} / 主力 ${formatMoneyFlow(item.main_net_inflow)}</p>
+                      <small>龙头 ${escapeHtml(item.leading_stock_name || "--")} ${item.leading_stock_code ? `· ${item.leading_stock_code}` : ""}</small>
+                    </article>
+                  `;
+                })
+                .join("")
+            : `<div class="placeholder-card overview-placeholder">暂无行业强度数据。</div>`}
+        </div>
+      </section>
+    </div>
+    <div class="overview-grid overview-grid-bottom">
+      <section class="overview-block">
+        <div class="overview-block-head">
+          <span>资金流前排</span>
+          <small>${escapeHtml(fundFlow?.trade_date || data.trade_date || "--")}</small>
+        </div>
+        <div class="overview-event-list">
+          ${fundIndustries.length
+            ? fundIndustries
+                .map(
+                  (item) => `
+                    <div class="overview-event-row">
+                      <span>
+                        <strong>${escapeHtml(item.sector_name || "--")}</strong>
+                        <small>${item.leading_stock_name ? `主力偏好 ${escapeHtml(item.leading_stock_name)}` : "行业资金流"}</small>
+                      </span>
+                      <span class="signal-badge ${Number(item.main_net_inflow || 0) > 0 ? "positive" : Number(item.main_net_inflow || 0) < 0 ? "negative" : ""}">${formatMoneyFlow(item.main_net_inflow)}</span>
+                      <small>${formatSignedPercent(item.pct_change)} · 占比 ${formatSignedPercent(item.main_net_inflow_ratio)}</small>
+                    </div>
+                  `
+                )
+                .join("")
+            : `<div class="placeholder-card overview-placeholder">暂无行业资金流数据。</div>`}
+        </div>
+      </section>
+      <section class="overview-block">
+        <div class="overview-block-head">
+          <span>连板与炸板</span>
+          <small>${numberFormatter.format(data.events?.consecutive_count || 0)} 只连板股 · 最高 ${numberFormatter.format(data.events?.max_consecutive_days || 0)} 板</small>
+        </div>
+        <div class="overview-event-columns">
+          <div class="overview-event-list">
+            <p class="overview-subtitle">连板前排</p>
+            ${renderEventRows(leaders, "今日暂无连板股。", (item) => (Number(item.consecutive_days || 0) >= 2 ? "positive" : ""))}
+          </div>
+          <div class="overview-event-list">
+            <p class="overview-subtitle">炸板观察</p>
+            ${renderEventRows(failedLimits, "今日暂无明显炸板。", () => "negative")}
+          </div>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+async function loadMarketOverview() {
+  try {
+    const result = await fetchJson(api.analysisMarketOverview);
+    renderMarketOverview(result.data);
+  } catch (error) {
+    $("marketOverview").innerHTML = `<div class="placeholder-card">市场结构加载失败。</div>`;
+  }
+}
+
 async function triggerSync(url, message, taskName) {
   state.pendingTasks[taskName] = true;
   updateTaskControls();
@@ -1471,6 +1684,7 @@ async function refreshDashboard({
   const tasks = [
     loadHealth().catch(() => null),
     loadSyncSummary().catch(() => null),
+    loadMarketOverview().catch(() => null),
   ];
 
   if (includeObservationPool) {
@@ -1571,6 +1785,7 @@ function bindEvents() {
       return;
     }
     loadSyncSummary().catch(() => null);
+    loadMarketOverview().catch(() => null);
     loadObservationPool().catch(() => null);
     loadFactorScorecard(state.selectedCode).catch(() => null);
     loadTechnicalAnalysis(state.selectedCode).catch(() => null);
@@ -1581,7 +1796,7 @@ async function initialize() {
   updateTaskControls();
   updateRangeButtons();
   resetChartSummary();
-  await Promise.all([loadHealth(), selectStock(state.selectedCode), loadObservationPool()]);
+  await Promise.all([loadHealth(), selectStock(state.selectedCode), loadObservationPool(), loadMarketOverview()]);
   loadSyncSummary().catch(() => null);
 }
 
@@ -1591,6 +1806,7 @@ state.syncSummaryTimer = window.setInterval(() => {
     return;
   }
   loadSyncSummary().catch(() => null);
+  loadMarketOverview().catch(() => null);
   loadObservationPool().catch(() => null);
   loadFactorScorecard(state.selectedCode).catch(() => null);
   loadTechnicalAnalysis(state.selectedCode).catch(() => null);

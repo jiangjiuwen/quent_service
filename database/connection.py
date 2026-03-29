@@ -344,6 +344,108 @@ class Database:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- 市场情绪日度快照
+        CREATE TABLE IF NOT EXISTS market_sentiment_daily (
+            trade_date DATE PRIMARY KEY,
+            sample_size INTEGER NOT NULL DEFAULT 0,
+            rising_count INTEGER NOT NULL DEFAULT 0,
+            falling_count INTEGER NOT NULL DEFAULT 0,
+            flat_count INTEGER NOT NULL DEFAULT 0,
+            strong_up_count INTEGER NOT NULL DEFAULT 0,
+            strong_down_count INTEGER NOT NULL DEFAULT 0,
+            limit_up_count INTEGER NOT NULL DEFAULT 0,
+            limit_down_count INTEGER NOT NULL DEFAULT 0,
+            failed_limit_count INTEGER NOT NULL DEFAULT 0,
+            above_ma20_count INTEGER NOT NULL DEFAULT 0,
+            advancing_ratio DECIMAL(10,6),
+            above_ma20_ratio DECIMAL(10,6),
+            limit_up_ratio DECIMAL(10,6),
+            failed_limit_ratio DECIMAL(10,6),
+            avg_pct_change DECIMAL(10,6),
+            sentiment_score INTEGER NOT NULL DEFAULT 0,
+            sentiment_label VARCHAR(32),
+            summary VARCHAR(255),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- 行业强度快照
+        CREATE TABLE IF NOT EXISTS sector_strength_daily (
+            trade_date DATE NOT NULL,
+            sector_name VARCHAR(100) NOT NULL,
+            stock_count INTEGER NOT NULL DEFAULT 0,
+            rising_count INTEGER NOT NULL DEFAULT 0,
+            limit_up_count INTEGER NOT NULL DEFAULT 0,
+            avg_pct_change DECIMAL(10,6),
+            avg_return_5d DECIMAL(10,6),
+            above_ma20_ratio DECIMAL(10,6),
+            strength_score INTEGER NOT NULL DEFAULT 0,
+            leading_stock_code VARCHAR(10),
+            leading_stock_name VARCHAR(100),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (trade_date, sector_name)
+        );
+
+        -- 连板 / 炸板等事件信号
+        CREATE TABLE IF NOT EXISTS stock_event_signals_daily (
+            trade_date DATE NOT NULL,
+            stock_code VARCHAR(10) NOT NULL,
+            stock_name VARCHAR(100) NOT NULL,
+            sector_name VARCHAR(100),
+            event_type VARCHAR(32) NOT NULL,
+            event_label VARCHAR(32),
+            event_value DECIMAL(10,4),
+            pct_change DECIMAL(10,6),
+            consecutive_days INTEGER NOT NULL DEFAULT 0,
+            rank_no INTEGER NOT NULL DEFAULT 0,
+            note VARCHAR(255),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (trade_date, stock_code, event_type)
+        );
+
+        -- 市场资金流快照
+        CREATE TABLE IF NOT EXISTS market_fund_flow_daily (
+            trade_date DATE PRIMARY KEY,
+            sh_close DECIMAL(10,4),
+            sh_pct_change DECIMAL(10,6),
+            sz_close DECIMAL(10,4),
+            sz_pct_change DECIMAL(10,6),
+            main_net_inflow DECIMAL(20,4),
+            main_net_inflow_ratio DECIMAL(10,6),
+            super_large_net_inflow DECIMAL(20,4),
+            super_large_net_inflow_ratio DECIMAL(10,6),
+            large_net_inflow DECIMAL(20,4),
+            large_net_inflow_ratio DECIMAL(10,6),
+            mid_net_inflow DECIMAL(20,4),
+            mid_net_inflow_ratio DECIMAL(10,6),
+            small_net_inflow DECIMAL(20,4),
+            small_net_inflow_ratio DECIMAL(10,6),
+            source VARCHAR(32),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- 板块资金流快照
+        CREATE TABLE IF NOT EXISTS sector_fund_flow_daily (
+            trade_date DATE NOT NULL,
+            sector_type VARCHAR(32) NOT NULL,
+            sector_name VARCHAR(100) NOT NULL,
+            rank_no INTEGER,
+            pct_change DECIMAL(10,6),
+            main_net_inflow DECIMAL(20,4),
+            main_net_inflow_ratio DECIMAL(10,6),
+            super_large_net_inflow DECIMAL(20,4),
+            super_large_net_inflow_ratio DECIMAL(10,6),
+            large_net_inflow DECIMAL(20,4),
+            large_net_inflow_ratio DECIMAL(10,6),
+            mid_net_inflow DECIMAL(20,4),
+            mid_net_inflow_ratio DECIMAL(10,6),
+            small_net_inflow DECIMAL(20,4),
+            small_net_inflow_ratio DECIMAL(10,6),
+            leading_stock_name VARCHAR(100),
+            source VARCHAR(32),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (trade_date, sector_type, sector_name)
+        );
+
         -- 同步日志表
         CREATE TABLE IF NOT EXISTS sync_logs (
             log_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -407,6 +509,21 @@ class Database:
             ON stock_factor_scores(is_watchlist, total_score);
         CREATE INDEX IF NOT EXISTS idx_factor_score_trade_date
             ON stock_factor_scores(trade_date);
+
+        CREATE INDEX IF NOT EXISTS idx_market_sentiment_score
+            ON market_sentiment_daily(sentiment_score, trade_date);
+
+        CREATE INDEX IF NOT EXISTS idx_sector_strength_rank
+            ON sector_strength_daily(trade_date, strength_score DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_stock_event_trade_type
+            ON stock_event_signals_daily(trade_date, event_type, rank_no);
+
+        CREATE INDEX IF NOT EXISTS idx_market_fund_flow_trade_date
+            ON market_fund_flow_daily(trade_date);
+
+        CREATE INDEX IF NOT EXISTS idx_sector_fund_flow_rank
+            ON sector_fund_flow_daily(trade_date, sector_type, rank_no);
 
         CREATE INDEX IF NOT EXISTS idx_sync_type ON sync_logs(sync_type);
         CREATE INDEX IF NOT EXISTS idx_sync_status ON sync_logs(status);

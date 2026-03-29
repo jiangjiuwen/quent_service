@@ -9,7 +9,17 @@ from config.settings import DATA_DIR
 
 
 SINGLE_INSTANCE_SYNC_TASKS = (
+    "adjust_factors",
+    "benchmark_index_kline",
+    "corporate_actions",
     "daily_kline",
+    "financial",
+    "index_list",
+    "market_overview_refresh",
+    "scorecard_refresh",
+    "stock_list",
+    "stock_profiles",
+    "trading_calendar",
 )
 
 LOCK_DIR = DATA_DIR / "task_locks"

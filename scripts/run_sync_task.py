@@ -9,12 +9,34 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.connection import db
-from sync.tasks import sync_daily_kline
+from sync.tasks import (
+    sync_adjust_factors,
+    sync_benchmark_index_kline,
+    sync_corporate_actions,
+    sync_daily_kline,
+    sync_financial_data,
+    sync_index_list,
+    sync_market_overview_refresh,
+    sync_scorecard_refresh,
+    sync_stock_list,
+    sync_stock_profiles,
+    sync_trade_calendar,
+)
 from utils.logger import logger
 
 
 TASK_RUNNERS = {
+    "adjust_factors": sync_adjust_factors,
+    "benchmark_index_kline": sync_benchmark_index_kline,
+    "corporate_actions": sync_corporate_actions,
     "daily_kline": sync_daily_kline,
+    "financial": sync_financial_data,
+    "index_list": sync_index_list,
+    "market_overview_refresh": sync_market_overview_refresh,
+    "scorecard_refresh": sync_scorecard_refresh,
+    "stock_list": sync_stock_list,
+    "stock_profiles": sync_stock_profiles,
+    "trading_calendar": sync_trade_calendar,
 }
 
 

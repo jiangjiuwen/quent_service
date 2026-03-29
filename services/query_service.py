@@ -67,21 +67,31 @@ class QueryService:
             )
 
     def _get_latest_sync_map(self) -> dict:
-        row = db.fetchone(
-            """
-            SELECT
-                sync_type,
-                start_time AS last_time,
-                status
-            FROM sync_logs
-            WHERE sync_type = 'daily_kline'
-            ORDER BY start_time DESC
-            LIMIT 1
+        placeholders = ", ".join("?" for _ in SINGLE_INSTANCE_SYNC_TASKS)
+        rows = db.fetchall(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    sync_type,
+                    start_time AS last_time,
+                    status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sync_type
+                        ORDER BY start_time DESC
+                    ) AS rn
+                FROM sync_logs
+                WHERE sync_type IN ({placeholders})
+            )
+            SELECT sync_type, last_time, status
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY sync_type
             """,
+            SINGLE_INSTANCE_SYNC_TASKS,
         )
-        if not row:
+        if not rows:
             return {}
-        return {row["sync_type"]: row}
+        return {row["sync_type"]: row for row in rows}
 
     def _sync_status_last_sync_payload(self, latest_sync_map: dict) -> list[dict]:
         return [

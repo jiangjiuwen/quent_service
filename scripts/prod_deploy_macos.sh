@@ -168,7 +168,7 @@ write_service_plist() {
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>set -a; source "${PROD_ENV_FILE}"; set +a; cd "${PROD_APP_DIR}"; exec "${PROD_VENV_DIR}/bin/python" "${PROD_APP_DIR}/main.py"</string>
+        <string>set -a; source "${PROD_ENV_FILE}"; set +a; cd "${PROD_APP_DIR}"; "${PROD_VENV_DIR}/bin/python" "${PROD_APP_DIR}/scripts/prod_migrate.py"; exec "${PROD_VENV_DIR}/bin/python" "${PROD_APP_DIR}/main.py"</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${PROD_APP_DIR}</string>
@@ -226,7 +226,7 @@ initialize_database() {
     (
         load_prod_env
         cd "${PROD_APP_DIR}"
-        "${PROD_VENV_DIR}/bin/python" -c 'from database.connection import db; db.init_tables()'
+        "${PROD_VENV_DIR}/bin/python" "${PROD_APP_DIR}/scripts/prod_migrate.py"
     )
 }
 

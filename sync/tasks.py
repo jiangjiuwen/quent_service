@@ -1,5 +1,7 @@
-from contextlib import contextmanager
+from collections import defaultdict
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta
+import io
 import json
 import os
 import re
@@ -26,6 +28,11 @@ AKSHARE_RETRY_BASE_DELAY = 1.0
 BAOSTOCK_SESSION_LOCK = threading.RLock()
 SOURCE_COOLDOWNS: dict[str, float] = {}
 TASK_WATCHDOG_SIGNAL = getattr(signal, "SIGUSR1", None)
+BENCHMARK_INDEX_CODES = ("399300", "000300", "399905", "000905")
+MARKET_OVERVIEW_RECENT_DAYS = 40
+MARKET_OVERVIEW_WARMUP_EXTRA_DAYS = 20
+MARKET_OVERVIEW_EVENT_STREAK_DAYS = 10
+MARKET_OVERVIEW_MIN_SECTOR_SIZE = 8
 
 
 class TaskProgressReporter:
@@ -758,6 +765,109 @@ def _fetch_index_list_with_akshare():
             "source": "akshare_sina",
         }
     return list(records.values())
+
+
+def _benchmark_index_seed_records():
+    """确保分析依赖的基准指数在指数池中有最小主数据"""
+    fallback_names = {
+        "399300": "沪深300",
+        "000300": "沪深300",
+        "399905": "中证500",
+        "000905": "中证500",
+    }
+    records = []
+    for index_code in BENCHMARK_INDEX_CODES:
+        meta = _infer_index_meta(index_code)
+        records.append(
+            {
+                "index_code": meta["index_code"],
+                "index_name": fallback_names.get(meta["index_code"], meta["index_code"]),
+                "market_type": meta["market_type"],
+                "exchange": meta["exchange"],
+                "index_type": meta["index_type"],
+                "list_date": None,
+                "delist_date": None,
+                "status": 1,
+                "source": "benchmark_seed",
+            }
+        )
+    return records
+
+
+def _resolve_benchmark_kline_fetch_window(index_code: str, start_date: Optional[str], end_date: Optional[str]) -> tuple[str, str]:
+    """基准指数缺少足够历史样本时，自动补取一段窗口用于相对强弱分析"""
+    effective_end_date = end_date or datetime.now().date().isoformat()
+    effective_start_date = start_date or effective_end_date
+    stats = db.fetchone(
+        """
+        SELECT COUNT(*) AS bar_count
+        FROM daily_kline
+        WHERE stock_code = ?
+        """,
+        (index_code,),
+    ) or {"bar_count": 0}
+    if int(stats.get("bar_count") or 0) < 130:
+        bootstrap_start = (date.fromisoformat(effective_end_date) - timedelta(days=240)).isoformat()
+        if bootstrap_start < effective_start_date:
+            effective_start_date = bootstrap_start
+    return effective_start_date, effective_end_date
+
+
+def _fetch_index_daily_kline_with_akshare(index_code: str, start_date: str, end_date: str):
+    """使用 akshare 抓取指数日线，静默掉进度条输出"""
+    import akshare as ak
+
+    def _call():
+        sink = io.StringIO()
+        with redirect_stdout(sink), redirect_stderr(sink):
+            return ak.index_zh_a_hist(
+                symbol=index_code,
+                period="daily",
+                start_date=start_date.replace("-", ""),
+                end_date=end_date.replace("-", ""),
+            )
+
+    index_df = _retry_call(f"{index_code} 指数日线抓取", _call)
+    if index_df is None or index_df.empty:
+        return []
+
+    records = []
+    previous_close = None
+    for _, row in index_df.iterrows():
+        close_price = _safe_float(row.get("收盘"))
+        pre_close = previous_close
+        pct_change = _safe_float(row.get("涨跌幅"))
+        if pct_change is None and previous_close not in (None, 0) and close_price is not None:
+            pct_change = round((close_price - previous_close) / previous_close * 100, 6)
+
+        volume = _safe_int(row.get("成交量"))
+        if volume is None:
+            volume = 0
+
+        records.append(
+            {
+                "trade_date": str(row.get("日期")),
+                "open_price": _safe_float(row.get("开盘")),
+                "high_price": _safe_float(row.get("最高")),
+                "low_price": _safe_float(row.get("最低")),
+                "close_price": close_price,
+                "pre_close": pre_close,
+                "pct_change": pct_change,
+                "volume": volume,
+                "amount": _safe_float(row.get("成交额")),
+                "turnover_rate": _safe_float(row.get("换手率", 0)),
+                "pe_ratio": None,
+                "pb_ratio": None,
+                "ps_ttm": None,
+                "pcf_ttm": None,
+                "tradestatus": 1,
+                "is_st": 0,
+                "source": "akshare_index",
+                "price_mode": "raw",
+            }
+        )
+        previous_close = close_price
+    return records
 
 
 def _fetch_financial_balance_sheet_with_akshare(stock_code: str):
@@ -2300,7 +2410,7 @@ def _task_running_message(task_label: str, exc: TaskAlreadyRunningError) -> str:
     return f"{task_label}已在运行，跳过重复触发{detail_text}"
 
 
-def _launch_async_stock_profile_sync(limit: int = 20, only_missing: bool = True) -> bool:
+def _launch_async_stock_profile_sync(limit: Optional[int] = 500, only_missing: bool = True) -> bool:
     """异步触发股票详情补充，不阻塞股票池主同步收尾"""
     result = spawn_sync_task(
         "stock_profiles",
@@ -2313,6 +2423,965 @@ def _launch_async_stock_profile_sync(limit: int = 20, only_missing: bool = True)
 
     logger.info("股票详情快照同步已在运行，跳过自动触发")
     return False
+
+
+def _recent_open_trade_dates(limit: int, end_date: Optional[str] = None) -> list[str]:
+    sql = """
+        SELECT trade_date
+        FROM trading_calendar
+        WHERE is_open = 1
+    """
+    params: list = []
+    if end_date:
+        sql += " AND trade_date <= ?"
+        params.append(end_date)
+    sql += " ORDER BY trade_date DESC LIMIT ?"
+    params.append(max(int(limit or 1), 1))
+    rows = db.fetchall(sql, tuple(params))
+    return [row["trade_date"] for row in reversed(rows)]
+
+
+def _average(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _ratio(numerator: float, denominator: float) -> Optional[float]:
+    if denominator in (None, 0):
+        return None
+    return numerator / denominator
+
+
+def _round_or_none(value: Optional[float], digits: int = 6):
+    if value is None:
+        return None
+    return round(value, digits)
+
+
+def _sector_name_from_industry(industry_code: Optional[str]) -> str:
+    text = _safe_text(industry_code)
+    if not text:
+        return "未分类"
+    return text.split(":", 1)[-1]
+
+
+def _sentiment_label_and_summary(
+    score: int,
+    advancing_ratio: Optional[float],
+    above_ma20_ratio: Optional[float],
+    avg_pct_change: Optional[float],
+    limit_up_count: int,
+    limit_down_count: int,
+    failed_limit_ratio: Optional[float],
+):
+    if score >= 78:
+        label = "强势扩散"
+        summary = "上涨家数、趋势占比和涨停数量同步占优，短线情绪处于扩散阶段。"
+    elif score >= 60:
+        label = "偏强活跃"
+        summary = "热点仍有承接，适合优先围绕强板块和前排个股观察。"
+    elif score >= 45:
+        label = "震荡分化"
+        summary = "市场分化明显，只适合做资金与趋势共振最强的方向。"
+    elif score >= 30:
+        label = "偏弱谨慎"
+        summary = "情绪承接一般，追高性价比偏低，仓位和节奏需要收紧。"
+    else:
+        label = "退潮防守"
+        summary = "涨停承接弱、修复不足，优先防守并等待更明确的修复信号。"
+
+    if failed_limit_ratio is not None and failed_limit_ratio >= 0.35 and limit_up_count > 0:
+        summary = "炸板占比偏高，短线承接不足，尽量减少追高。"
+    elif (
+        advancing_ratio is not None
+        and above_ma20_ratio is not None
+        and avg_pct_change is not None
+        and advancing_ratio >= 0.62
+        and above_ma20_ratio >= 0.58
+        and avg_pct_change >= 0.8
+    ):
+        summary = "普涨与趋势共振较强，强势方向更容易走出连续性。"
+    elif limit_down_count >= max(6, limit_up_count // 2):
+        summary = "跌停与负反馈仍在，强弱切换较快，节奏上宜更保守。"
+    return label, summary
+
+
+def _upsert_market_sentiment_rows(sentiment_rows: list[dict]):
+    if not sentiment_rows:
+        return
+
+    sql = """
+        INSERT INTO market_sentiment_daily (
+            trade_date, sample_size, rising_count, falling_count, flat_count,
+            strong_up_count, strong_down_count, limit_up_count, limit_down_count,
+            failed_limit_count, above_ma20_count, advancing_ratio, above_ma20_ratio,
+            limit_up_ratio, failed_limit_ratio, avg_pct_change, sentiment_score,
+            sentiment_label, summary, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+            sample_size = excluded.sample_size,
+            rising_count = excluded.rising_count,
+            falling_count = excluded.falling_count,
+            flat_count = excluded.flat_count,
+            strong_up_count = excluded.strong_up_count,
+            strong_down_count = excluded.strong_down_count,
+            limit_up_count = excluded.limit_up_count,
+            limit_down_count = excluded.limit_down_count,
+            failed_limit_count = excluded.failed_limit_count,
+            above_ma20_count = excluded.above_ma20_count,
+            advancing_ratio = excluded.advancing_ratio,
+            above_ma20_ratio = excluded.above_ma20_ratio,
+            limit_up_ratio = excluded.limit_up_ratio,
+            failed_limit_ratio = excluded.failed_limit_ratio,
+            avg_pct_change = excluded.avg_pct_change,
+            sentiment_score = excluded.sentiment_score,
+            sentiment_label = excluded.sentiment_label,
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+    """
+    with db.get_connection() as conn:
+        conn.executemany(
+            sql,
+            [
+                (
+                    row["trade_date"],
+                    row["sample_size"],
+                    row["rising_count"],
+                    row["falling_count"],
+                    row["flat_count"],
+                    row["strong_up_count"],
+                    row["strong_down_count"],
+                    row["limit_up_count"],
+                    row["limit_down_count"],
+                    row["failed_limit_count"],
+                    row["above_ma20_count"],
+                    row.get("advancing_ratio"),
+                    row.get("above_ma20_ratio"),
+                    row.get("limit_up_ratio"),
+                    row.get("failed_limit_ratio"),
+                    row.get("avg_pct_change"),
+                    row["sentiment_score"],
+                    row.get("sentiment_label"),
+                    row.get("summary"),
+                    row["updated_at"],
+                )
+                for row in sentiment_rows
+            ],
+        )
+
+
+def _replace_sector_strength_rows(trade_date: str, sector_rows: list[dict]):
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM sector_strength_daily WHERE trade_date = ?", (trade_date,))
+        if not sector_rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO sector_strength_daily (
+                trade_date, sector_name, stock_count, rising_count, limit_up_count,
+                avg_pct_change, avg_return_5d, above_ma20_ratio, strength_score,
+                leading_stock_code, leading_stock_name, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["trade_date"],
+                    row["sector_name"],
+                    row["stock_count"],
+                    row["rising_count"],
+                    row["limit_up_count"],
+                    row.get("avg_pct_change"),
+                    row.get("avg_return_5d"),
+                    row.get("above_ma20_ratio"),
+                    row["strength_score"],
+                    row.get("leading_stock_code"),
+                    row.get("leading_stock_name"),
+                    row["updated_at"],
+                )
+                for row in sector_rows
+            ],
+        )
+
+
+def _replace_stock_event_rows(trade_date: str, event_rows: list[dict]):
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM stock_event_signals_daily WHERE trade_date = ?", (trade_date,))
+        if not event_rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO stock_event_signals_daily (
+                trade_date, stock_code, stock_name, sector_name, event_type,
+                event_label, event_value, pct_change, consecutive_days, rank_no,
+                note, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["trade_date"],
+                    row["stock_code"],
+                    row["stock_name"],
+                    row.get("sector_name"),
+                    row["event_type"],
+                    row.get("event_label"),
+                    row.get("event_value"),
+                    row.get("pct_change"),
+                    row.get("consecutive_days", 0),
+                    row.get("rank_no", 0),
+                    row.get("note"),
+                    row["updated_at"],
+                )
+                for row in event_rows
+            ],
+        )
+
+
+def _upsert_market_fund_flow_rows(fund_flow_rows: list[dict]):
+    if not fund_flow_rows:
+        return
+    with db.get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO market_fund_flow_daily (
+                trade_date, sh_close, sh_pct_change, sz_close, sz_pct_change,
+                main_net_inflow, main_net_inflow_ratio, super_large_net_inflow,
+                super_large_net_inflow_ratio, large_net_inflow, large_net_inflow_ratio,
+                mid_net_inflow, mid_net_inflow_ratio, small_net_inflow,
+                small_net_inflow_ratio, source, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                sh_close = excluded.sh_close,
+                sh_pct_change = excluded.sh_pct_change,
+                sz_close = excluded.sz_close,
+                sz_pct_change = excluded.sz_pct_change,
+                main_net_inflow = excluded.main_net_inflow,
+                main_net_inflow_ratio = excluded.main_net_inflow_ratio,
+                super_large_net_inflow = excluded.super_large_net_inflow,
+                super_large_net_inflow_ratio = excluded.super_large_net_inflow_ratio,
+                large_net_inflow = excluded.large_net_inflow,
+                large_net_inflow_ratio = excluded.large_net_inflow_ratio,
+                mid_net_inflow = excluded.mid_net_inflow,
+                mid_net_inflow_ratio = excluded.mid_net_inflow_ratio,
+                small_net_inflow = excluded.small_net_inflow,
+                small_net_inflow_ratio = excluded.small_net_inflow_ratio,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (
+                    row["trade_date"],
+                    row.get("sh_close"),
+                    row.get("sh_pct_change"),
+                    row.get("sz_close"),
+                    row.get("sz_pct_change"),
+                    row.get("main_net_inflow"),
+                    row.get("main_net_inflow_ratio"),
+                    row.get("super_large_net_inflow"),
+                    row.get("super_large_net_inflow_ratio"),
+                    row.get("large_net_inflow"),
+                    row.get("large_net_inflow_ratio"),
+                    row.get("mid_net_inflow"),
+                    row.get("mid_net_inflow_ratio"),
+                    row.get("small_net_inflow"),
+                    row.get("small_net_inflow_ratio"),
+                    row.get("source"),
+                    row["updated_at"],
+                )
+                for row in fund_flow_rows
+            ],
+        )
+
+
+def _replace_sector_fund_flow_rows(trade_date: str, sector_type: str, rows: list[dict]):
+    with db.get_connection() as conn:
+        conn.execute(
+            "DELETE FROM sector_fund_flow_daily WHERE trade_date = ? AND sector_type = ?",
+            (trade_date, sector_type),
+        )
+        if not rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO sector_fund_flow_daily (
+                trade_date, sector_type, sector_name, rank_no, pct_change,
+                main_net_inflow, main_net_inflow_ratio, super_large_net_inflow,
+                super_large_net_inflow_ratio, large_net_inflow, large_net_inflow_ratio,
+                mid_net_inflow, mid_net_inflow_ratio, small_net_inflow,
+                small_net_inflow_ratio, leading_stock_name, source, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["trade_date"],
+                    row["sector_type"],
+                    row["sector_name"],
+                    row.get("rank_no"),
+                    row.get("pct_change"),
+                    row.get("main_net_inflow"),
+                    row.get("main_net_inflow_ratio"),
+                    row.get("super_large_net_inflow"),
+                    row.get("super_large_net_inflow_ratio"),
+                    row.get("large_net_inflow"),
+                    row.get("large_net_inflow_ratio"),
+                    row.get("mid_net_inflow"),
+                    row.get("mid_net_inflow_ratio"),
+                    row.get("small_net_inflow"),
+                    row.get("small_net_inflow_ratio"),
+                    row.get("leading_stock_name"),
+                    row.get("source"),
+                    row["updated_at"],
+                )
+                for row in rows
+            ],
+        )
+
+
+def _fetch_market_fund_flow_with_akshare() -> list[dict]:
+    import akshare as ak
+
+    def _call():
+        sink = io.StringIO()
+        with redirect_stdout(sink), redirect_stderr(sink):
+            return ak.stock_market_fund_flow()
+
+    fund_flow_df = _retry_call("市场资金流抓取", _call)
+    if fund_flow_df is None or fund_flow_df.empty:
+        return []
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for _, row in fund_flow_df.iterrows():
+        rows.append(
+            {
+                "trade_date": _normalize_date_text(row.get("日期")),
+                "sh_close": _safe_float(row.get("上证-收盘价")),
+                "sh_pct_change": _safe_float(row.get("上证-涨跌幅")),
+                "sz_close": _safe_float(row.get("深证-收盘价")),
+                "sz_pct_change": _safe_float(row.get("深证-涨跌幅")),
+                "main_net_inflow": _safe_float(row.get("主力净流入-净额")),
+                "main_net_inflow_ratio": _safe_float(row.get("主力净流入-净占比")),
+                "super_large_net_inflow": _safe_float(row.get("超大单净流入-净额")),
+                "super_large_net_inflow_ratio": _safe_float(row.get("超大单净流入-净占比")),
+                "large_net_inflow": _safe_float(row.get("大单净流入-净额")),
+                "large_net_inflow_ratio": _safe_float(row.get("大单净流入-净占比")),
+                "mid_net_inflow": _safe_float(row.get("中单净流入-净额")),
+                "mid_net_inflow_ratio": _safe_float(row.get("中单净流入-净占比")),
+                "small_net_inflow": _safe_float(row.get("小单净流入-净额")),
+                "small_net_inflow_ratio": _safe_float(row.get("小单净流入-净占比")),
+                "source": "akshare_market_fund_flow",
+                "updated_at": updated_at,
+            }
+        )
+    return rows
+
+
+def _fetch_sector_fund_flow_with_akshare(trade_date: str, sector_type: str) -> list[dict]:
+    import akshare as ak
+
+    def _call():
+        sink = io.StringIO()
+        with redirect_stdout(sink), redirect_stderr(sink):
+            return ak.stock_sector_fund_flow_rank(indicator="今日", sector_type=sector_type)
+
+    sector_df = _retry_call(f"{sector_type}抓取", _call)
+    if sector_df is None or sector_df.empty:
+        return []
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for _, row in sector_df.iterrows():
+        rows.append(
+            {
+                "trade_date": trade_date,
+                "sector_type": sector_type,
+                "sector_name": _safe_text(row.get("名称")),
+                "rank_no": _safe_int(row.get("序号")),
+                "pct_change": _safe_float(row.get("今日涨跌幅")),
+                "main_net_inflow": _safe_float(row.get("今日主力净流入-净额")),
+                "main_net_inflow_ratio": _safe_float(row.get("今日主力净流入-净占比")),
+                "super_large_net_inflow": _safe_float(row.get("今日超大单净流入-净额")),
+                "super_large_net_inflow_ratio": _safe_float(row.get("今日超大单净流入-净占比")),
+                "large_net_inflow": _safe_float(row.get("今日大单净流入-净额")),
+                "large_net_inflow_ratio": _safe_float(row.get("今日大单净流入-净占比")),
+                "mid_net_inflow": _safe_float(row.get("今日中单净流入-净额")),
+                "mid_net_inflow_ratio": _safe_float(row.get("今日中单净流入-净占比")),
+                "small_net_inflow": _safe_float(row.get("今日小单净流入-净额")),
+                "small_net_inflow_ratio": _safe_float(row.get("今日小单净流入-净占比")),
+                "leading_stock_name": _safe_text(row.get("今日主力净流入最大股")),
+                "source": "akshare_sector_fund_flow",
+                "updated_at": updated_at,
+            }
+        )
+    return rows
+
+
+def _compute_market_overview_snapshot(latest_trade_date: str) -> dict:
+    target_dates = _recent_open_trade_dates(MARKET_OVERVIEW_RECENT_DAYS, latest_trade_date)
+    if not target_dates:
+        return {
+            "trade_date": latest_trade_date,
+            "sentiment_rows": [],
+            "sector_rows": [],
+            "event_rows": [],
+        }
+
+    warmup_dates = _recent_open_trade_dates(
+        MARKET_OVERVIEW_RECENT_DAYS + MARKET_OVERVIEW_WARMUP_EXTRA_DAYS,
+        latest_trade_date,
+    )
+    date_set = set(target_dates)
+    latest_streak_dates = set(_recent_open_trade_dates(MARKET_OVERVIEW_EVENT_STREAK_DAYS, latest_trade_date))
+    placeholders = ", ".join("?" for _ in warmup_dates)
+    rows = db.fetchall(
+        f"""
+        SELECT
+            dk.stock_code,
+            s.stock_name,
+            s.industry_code,
+            dk.trade_date,
+            dk.close_price,
+            dk.high_price,
+            dk.pct_change,
+            COALESCE(dtf.is_suspended, 0) AS is_suspended,
+            COALESCE(dtf.is_st, 0) AS is_st,
+            COALESCE(dtf.is_limit_up, 0) AS is_limit_up,
+            COALESCE(dtf.is_limit_down, 0) AS is_limit_down,
+            dtf.limit_up_price
+        FROM daily_kline dk
+        JOIN stocks s
+          ON s.stock_code = dk.stock_code
+        LEFT JOIN daily_trade_flags dtf
+          ON dtf.stock_code = dk.stock_code
+         AND dtf.trade_date = dk.trade_date
+        WHERE s.status = 1
+          AND dk.trade_date IN ({placeholders})
+        ORDER BY dk.stock_code ASC, dk.trade_date ASC
+        """,
+        tuple(warmup_dates),
+    )
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    sentiment_by_date = {
+        trade_date: {
+            "trade_date": trade_date,
+            "sample_size": 0,
+            "rising_count": 0,
+            "falling_count": 0,
+            "flat_count": 0,
+            "strong_up_count": 0,
+            "strong_down_count": 0,
+            "limit_up_count": 0,
+            "limit_down_count": 0,
+            "failed_limit_count": 0,
+            "above_ma20_count": 0,
+            "pct_changes": [],
+        }
+        for trade_date in target_dates
+    }
+    sector_latest_metrics: dict[str, list[dict]] = defaultdict(list)
+    limit_up_events: list[dict] = []
+    consecutive_events: list[dict] = []
+    failed_limit_events: list[dict] = []
+
+    grouped_rows: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped_rows[row["stock_code"]].append(row)
+
+    for stock_rows in grouped_rows.values():
+        closes: list[Optional[float]] = []
+        derived_rows: list[dict] = []
+        for row in stock_rows:
+            close_price = _safe_float(row.get("close_price"))
+            high_price = _safe_float(row.get("high_price"))
+            pct_change = _safe_float(row.get("pct_change"))
+            limit_up_price = _safe_float(row.get("limit_up_price"))
+            is_limit_up = int(row.get("is_limit_up") or 0)
+            is_limit_down = int(row.get("is_limit_down") or 0)
+            is_st = int(row.get("is_st") or 0)
+            is_suspended = int(row.get("is_suspended") or 0)
+
+            closes.append(close_price)
+            ma20 = None
+            if len(closes) >= 20:
+                ma_window = closes[-20:]
+                if all(value not in (None, 0) for value in ma_window):
+                    ma20 = sum(ma_window) / 20
+
+            return_5d = None
+            if len(closes) >= 6 and close_price not in (None, 0) and closes[-6] not in (None, 0):
+                return_5d = (close_price / closes[-6]) - 1
+
+            failed_limit = bool(
+                limit_up_price not in (None, 0)
+                and high_price is not None
+                and close_price is not None
+                and high_price >= (limit_up_price - 0.011)
+                and not is_limit_up
+                and close_price < (limit_up_price - 0.011)
+            )
+            gap_to_limit = None
+            if limit_up_price not in (None, 0) and close_price is not None:
+                gap_to_limit = (close_price / limit_up_price) - 1
+
+            derived = {
+                "trade_date": row["trade_date"],
+                "stock_code": row["stock_code"],
+                "stock_name": row["stock_name"],
+                "sector_name": _sector_name_from_industry(row.get("industry_code")),
+                "close_price": close_price,
+                "pct_change": pct_change,
+                "ma20": ma20,
+                "return_5d": return_5d,
+                "is_limit_up": is_limit_up,
+                "is_limit_down": is_limit_down,
+                "is_st": is_st,
+                "is_suspended": is_suspended,
+                "failed_limit": failed_limit,
+                "gap_to_limit": gap_to_limit,
+            }
+            derived_rows.append(derived)
+
+            if row["trade_date"] not in date_set:
+                continue
+            if is_st or is_suspended or close_price is None:
+                continue
+
+            sentiment = sentiment_by_date[row["trade_date"]]
+            sentiment["sample_size"] += 1
+            sentiment["pct_changes"].append(pct_change or 0.0)
+            if (pct_change or 0.0) > 0:
+                sentiment["rising_count"] += 1
+            elif (pct_change or 0.0) < 0:
+                sentiment["falling_count"] += 1
+            else:
+                sentiment["flat_count"] += 1
+            if (pct_change or 0.0) >= 3:
+                sentiment["strong_up_count"] += 1
+            if (pct_change or 0.0) <= -3:
+                sentiment["strong_down_count"] += 1
+            if is_limit_up:
+                sentiment["limit_up_count"] += 1
+            if is_limit_down:
+                sentiment["limit_down_count"] += 1
+            if failed_limit:
+                sentiment["failed_limit_count"] += 1
+            if ma20 not in (None, 0) and close_price > ma20:
+                sentiment["above_ma20_count"] += 1
+
+            if row["trade_date"] == latest_trade_date:
+                sector_latest_metrics[derived["sector_name"]].append(derived)
+
+        latest_row = derived_rows[-1] if derived_rows else None
+        if (
+            latest_row
+            and latest_row["trade_date"] == latest_trade_date
+            and not latest_row["is_st"]
+            and not latest_row["is_suspended"]
+        ):
+            streak = 0
+            for row in reversed(derived_rows):
+                if row["trade_date"] not in latest_streak_dates:
+                    continue
+                if row["is_limit_up"]:
+                    streak += 1
+                    continue
+                break
+
+            if latest_row["is_limit_up"]:
+                base_event = {
+                    "trade_date": latest_trade_date,
+                    "stock_code": latest_row["stock_code"],
+                    "stock_name": latest_row["stock_name"],
+                    "sector_name": latest_row["sector_name"],
+                    "pct_change": _round_or_none(latest_row["pct_change"], 6),
+                    "consecutive_days": streak,
+                    "updated_at": updated_at,
+                }
+                limit_up_events.append(
+                    {
+                        **base_event,
+                        "event_type": "limit_up",
+                        "event_label": "涨停",
+                        "event_value": 1.0,
+                        "note": f"{streak} 连板" if streak >= 2 else "首板/反包",
+                    }
+                )
+                if streak >= 2:
+                    consecutive_events.append(
+                        {
+                            **base_event,
+                            "event_type": "consecutive_limit_up",
+                            "event_label": f"{streak} 连板",
+                            "event_value": float(streak),
+                            "note": f"{streak} 连板延续",
+                        }
+                    )
+
+            if latest_row["failed_limit"]:
+                gap_pct = None
+                if latest_row["gap_to_limit"] is not None:
+                    gap_pct = abs(latest_row["gap_to_limit"]) * 100
+                failed_limit_events.append(
+                    {
+                        "trade_date": latest_trade_date,
+                        "stock_code": latest_row["stock_code"],
+                        "stock_name": latest_row["stock_name"],
+                        "sector_name": latest_row["sector_name"],
+                        "event_type": "failed_limit_up",
+                        "event_label": "炸板",
+                        "event_value": _round_or_none(latest_row["gap_to_limit"], 6),
+                        "pct_change": _round_or_none(latest_row["pct_change"], 6),
+                        "consecutive_days": 0,
+                        "note": f"封板回落 {gap_pct:.2f}%" if gap_pct is not None else "冲板后回落",
+                        "updated_at": updated_at,
+                    }
+                )
+
+    sentiment_rows = []
+    for trade_date in target_dates:
+        item = sentiment_by_date[trade_date]
+        sample_size = int(item["sample_size"] or 0)
+        advancing_ratio = _ratio(item["rising_count"], sample_size)
+        above_ma20_ratio = _ratio(item["above_ma20_count"], sample_size)
+        limit_up_ratio = _ratio(item["limit_up_count"], sample_size)
+        failed_base = item["limit_up_count"] + item["failed_limit_count"]
+        failed_limit_ratio = _ratio(item["failed_limit_count"], failed_base)
+        avg_pct_change = _average(item["pct_changes"])
+
+        score_points = 0
+        if advancing_ratio is not None and advancing_ratio >= 0.55:
+            score_points += 1
+        if advancing_ratio is not None and advancing_ratio >= 0.65:
+            score_points += 1
+        if above_ma20_ratio is not None and above_ma20_ratio >= 0.55:
+            score_points += 1
+        if above_ma20_ratio is not None and above_ma20_ratio >= 0.65:
+            score_points += 1
+        if avg_pct_change is not None and avg_pct_change > 0:
+            score_points += 1
+        if avg_pct_change is not None and avg_pct_change >= 1.0:
+            score_points += 1
+        if item["limit_up_count"] >= 40 and item["limit_up_count"] >= item["limit_down_count"] * 3:
+            score_points += 1
+        if failed_limit_ratio is not None and failed_limit_ratio <= 0.30 and failed_base >= 20:
+            score_points += 1
+
+        sentiment_score = min(score_points * 12, 96) if score_points else 0
+        label, summary = _sentiment_label_and_summary(
+            sentiment_score,
+            advancing_ratio,
+            above_ma20_ratio,
+            avg_pct_change,
+            item["limit_up_count"],
+            item["limit_down_count"],
+            failed_limit_ratio,
+        )
+        sentiment_rows.append(
+            {
+                "trade_date": trade_date,
+                "sample_size": sample_size,
+                "rising_count": item["rising_count"],
+                "falling_count": item["falling_count"],
+                "flat_count": item["flat_count"],
+                "strong_up_count": item["strong_up_count"],
+                "strong_down_count": item["strong_down_count"],
+                "limit_up_count": item["limit_up_count"],
+                "limit_down_count": item["limit_down_count"],
+                "failed_limit_count": item["failed_limit_count"],
+                "above_ma20_count": item["above_ma20_count"],
+                "advancing_ratio": _round_or_none(advancing_ratio, 6),
+                "above_ma20_ratio": _round_or_none(above_ma20_ratio, 6),
+                "limit_up_ratio": _round_or_none(limit_up_ratio, 6),
+                "failed_limit_ratio": _round_or_none(failed_limit_ratio, 6),
+                "avg_pct_change": _round_or_none(avg_pct_change, 6),
+                "sentiment_score": sentiment_score,
+                "sentiment_label": label,
+                "summary": summary,
+                "updated_at": updated_at,
+            }
+        )
+
+    sector_rows = []
+    for sector_name, items in sector_latest_metrics.items():
+        stock_count = len(items)
+        if stock_count < MARKET_OVERVIEW_MIN_SECTOR_SIZE:
+            continue
+        rising_count = sum(1 for item in items if (item.get("pct_change") or 0.0) > 0)
+        limit_up_count = sum(1 for item in items if item.get("is_limit_up"))
+        avg_pct_change = _average([item.get("pct_change") or 0.0 for item in items])
+        avg_return_5d = _average([item["return_5d"] for item in items if item.get("return_5d") is not None])
+        above_ma20_ratio = _ratio(
+            sum(1 for item in items if item.get("ma20") not in (None, 0) and item.get("close_price") is not None and item["close_price"] > item["ma20"]),
+            stock_count,
+        )
+        advancing_ratio = _ratio(rising_count, stock_count) or 0.0
+        strength_score = max(
+            0,
+            min(
+                100,
+                int(
+                    round(
+                        (avg_pct_change or 0.0) * 7
+                        + (avg_return_5d or 0.0) * 160
+                        + (above_ma20_ratio or 0.0) * 32
+                        + advancing_ratio * 24
+                        + min(limit_up_count, 6) * 3
+                    )
+                ),
+            ),
+        )
+        leader = max(
+            items,
+            key=lambda item: (
+                int(item.get("is_limit_up") or 0),
+                int(item.get("consecutive_days") or 0),
+                item.get("pct_change") or -999.0,
+                item.get("return_5d") or -999.0,
+            ),
+        )
+        sector_rows.append(
+            {
+                "trade_date": latest_trade_date,
+                "sector_name": sector_name,
+                "stock_count": stock_count,
+                "rising_count": rising_count,
+                "limit_up_count": limit_up_count,
+                "avg_pct_change": _round_or_none(avg_pct_change, 6),
+                "avg_return_5d": _round_or_none(avg_return_5d, 6),
+                "above_ma20_ratio": _round_or_none(above_ma20_ratio, 6),
+                "strength_score": strength_score,
+                "leading_stock_code": leader.get("stock_code"),
+                "leading_stock_name": leader.get("stock_name"),
+                "updated_at": updated_at,
+            }
+        )
+
+    sector_rows.sort(
+        key=lambda row: (
+            row["strength_score"],
+            row.get("avg_return_5d") or -999.0,
+            row.get("avg_pct_change") or -999.0,
+            row["stock_count"],
+        ),
+        reverse=True,
+    )
+
+    limit_up_events.sort(
+        key=lambda row: (
+            row.get("consecutive_days") or 0,
+            row.get("pct_change") or -999.0,
+            row["stock_code"],
+        ),
+        reverse=True,
+    )
+    consecutive_events.sort(
+        key=lambda row: (
+            row.get("consecutive_days") or 0,
+            row.get("pct_change") or -999.0,
+            row["stock_code"],
+        ),
+        reverse=True,
+    )
+    failed_limit_events.sort(
+        key=lambda row: (
+            row.get("event_value") if row.get("event_value") is not None else -999.0,
+            row.get("pct_change") or -999.0,
+            row["stock_code"],
+        )
+    )
+
+    for index, row in enumerate(limit_up_events, start=1):
+        row["rank_no"] = index
+    for index, row in enumerate(consecutive_events, start=1):
+        row["rank_no"] = index
+    for index, row in enumerate(failed_limit_events, start=1):
+        row["rank_no"] = index
+
+    return {
+        "trade_date": latest_trade_date,
+        "sentiment_rows": sentiment_rows,
+        "sector_rows": sector_rows,
+        "event_rows": limit_up_events + consecutive_events + failed_limit_events,
+    }
+
+
+def sync_scorecard_refresh(manage_log: bool = True):
+    """异步刷新全市场短线机会评分卡"""
+    try:
+        with task_lock("scorecard_refresh") as task_handle:
+            log_id = log_sync_start("scorecard_refresh") if manage_log else None
+            reporter = TaskProgressReporter("scorecard_refresh", task_handle, log_id)
+            reporter.update(
+                force=True,
+                stage="初始化短线评分刷新",
+                processed=0,
+                success=0,
+                fail=0,
+                total=None,
+            )
+            logger.info("开始刷新短线机会评分卡...")
+
+            try:
+                summary = factor_service.refresh_scorecard()
+                total = int(summary.get("total") or 0)
+                reporter.update(
+                    force=True,
+                    stage="短线评分刷新完成",
+                    total=total,
+                    processed=total,
+                    success=total,
+                    fail=0,
+                    current_item=summary.get("trade_date"),
+                )
+                if manage_log:
+                    log_sync_end(log_id, "success", total, total, 0)
+                logger.info(f"短线机会评分卡刷新完成: 总数{total}, 观察池{summary.get('watchlist_count')}")
+                return summary
+            except Exception as e:
+                reporter.update(force=True, stage="短线评分刷新失败", error_message=str(e))
+                if manage_log:
+                    log_sync_end(log_id, "failed", error=str(e))
+                logger.error(f"短线机会评分卡刷新失败: {e}")
+                if manage_log:
+                    return {"total": 0, "watchlist_count": 0}
+                raise
+    except TaskAlreadyRunningError as e:
+        message = _task_running_message("短线机会评分刷新", e)
+        logger.warning(message)
+        if manage_log:
+            return {"total": 0, "watchlist_count": 0, "skipped": True}
+        raise
+
+
+def sync_market_overview_refresh(manage_log: bool = True):
+    """刷新市场结构总览缓存"""
+    try:
+        with task_lock("market_overview_refresh") as task_handle:
+            log_id = log_sync_start("market_overview_refresh") if manage_log else None
+            reporter = TaskProgressReporter("market_overview_refresh", task_handle, log_id)
+            reporter.update(
+                force=True,
+                stage="初始化市场结构刷新",
+                processed=0,
+                success=0,
+                fail=0,
+                total=4,
+            )
+            logger.info("开始刷新市场结构总览缓存...")
+
+            try:
+                latest_trade_date = db.fetchone(
+                    """
+                    SELECT MAX(trade_date) AS value
+                    FROM daily_kline
+                    """
+                )
+                resolved_trade_date = latest_trade_date.get("value") if latest_trade_date else None
+                if not resolved_trade_date:
+                    reporter.update(force=True, stage="无日线数据", total=0, processed=0, success=0, fail=0)
+                    if manage_log:
+                        log_sync_end(log_id, "success", 0, 0, 0)
+                    return {"trade_date": None, "sentiment_days": 0, "sector_count": 0, "event_count": 0}
+
+                reporter.update(
+                    force=True,
+                    stage="计算市场情绪与板块强度",
+                    total=4,
+                    processed=1,
+                    success=1,
+                    fail=0,
+                    current_item=resolved_trade_date,
+                )
+                snapshot = _compute_market_overview_snapshot(resolved_trade_date)
+                _upsert_market_sentiment_rows(snapshot["sentiment_rows"])
+                _replace_sector_strength_rows(resolved_trade_date, snapshot["sector_rows"])
+                _replace_stock_event_rows(resolved_trade_date, snapshot["event_rows"])
+
+                reporter.update(
+                    force=True,
+                    stage="同步市场资金流",
+                    total=4,
+                    processed=2,
+                    success=2,
+                    fail=0,
+                    current_item=resolved_trade_date,
+                )
+                fund_flow_warning = None
+                try:
+                    market_fund_flow_rows = _fetch_market_fund_flow_with_akshare()
+                    _upsert_market_fund_flow_rows(market_fund_flow_rows)
+                except Exception as exc:
+                    fund_flow_warning = f"市场资金流刷新失败: {exc}"
+                    logger.warning(fund_flow_warning)
+
+                reporter.update(
+                    force=True,
+                    stage="同步行业/概念资金流",
+                    total=4,
+                    processed=3,
+                    success=3,
+                    fail=0,
+                    current_item=resolved_trade_date,
+                )
+                sector_fund_flow_warning = None
+                try:
+                    for sector_type in ("行业资金流", "概念资金流"):
+                        sector_fund_flow_rows = _fetch_sector_fund_flow_with_akshare(resolved_trade_date, sector_type)
+                        if sector_fund_flow_rows:
+                            _replace_sector_fund_flow_rows(resolved_trade_date, sector_type, sector_fund_flow_rows)
+                except Exception as exc:
+                    sector_fund_flow_warning = f"板块资金流刷新失败: {exc}"
+                    logger.warning(sector_fund_flow_warning)
+
+                reporter.update(
+                    force=True,
+                    stage="市场结构刷新完成",
+                    total=4,
+                    processed=4,
+                    success=4,
+                    fail=0,
+                    current_item=resolved_trade_date,
+                    sentiment_days=len(snapshot["sentiment_rows"]),
+                    sector_count=len(snapshot["sector_rows"]),
+                    event_count=len(snapshot["event_rows"]),
+                )
+                if manage_log:
+                    log_sync_end(log_id, "success", 4, 4, 0)
+                logger.info(
+                    "市场结构总览缓存刷新完成: "
+                    f"trade_date={resolved_trade_date}, "
+                    f"sentiment_days={len(snapshot['sentiment_rows'])}, "
+                    f"sector_count={len(snapshot['sector_rows'])}, "
+                    f"event_count={len(snapshot['event_rows'])}"
+                )
+                return {
+                    "trade_date": resolved_trade_date,
+                    "sentiment_days": len(snapshot["sentiment_rows"]),
+                    "sector_count": len(snapshot["sector_rows"]),
+                    "event_count": len(snapshot["event_rows"]),
+                    "fund_flow_warning": fund_flow_warning,
+                    "sector_fund_flow_warning": sector_fund_flow_warning,
+                }
+            except Exception as e:
+                reporter.update(force=True, stage="市场结构刷新失败", error_message=str(e))
+                if manage_log:
+                    log_sync_end(log_id, "failed", error=str(e))
+                logger.error(f"市场结构总览缓存刷新失败: {e}")
+                if manage_log:
+                    return {"trade_date": None, "sentiment_days": 0, "sector_count": 0, "event_count": 0}
+                raise
+    except TaskAlreadyRunningError as e:
+        message = _task_running_message("市场结构刷新", e)
+        logger.warning(message)
+        if manage_log:
+            return {"trade_date": None, "sentiment_days": 0, "sector_count": 0, "event_count": 0, "skipped": True}
+        raise
 
 
 def sync_trade_calendar(manage_log: bool = True):
@@ -2376,7 +3445,12 @@ def sync_trade_calendar(manage_log: bool = True):
         raise
 
 
-def sync_stock_profiles(limit: int = 20, offset: int = 0, only_missing: bool = True, manage_log: bool = True):
+def sync_stock_profiles(
+    limit: Optional[int] = 20,
+    offset: int = 0,
+    only_missing: bool = True,
+    manage_log: bool = True,
+):
     """补充股票详情快照"""
     try:
         with task_lock("stock_profiles") as task_handle:
@@ -2392,32 +3466,32 @@ def sync_stock_profiles(limit: int = 20, offset: int = 0, only_missing: bool = T
                 offset=offset,
                 only_missing=only_missing,
             )
-            logger.info(f"开始同步股票详情快照: limit={limit}, offset={offset}, only_missing={only_missing}")
+            logger.info(f"开始同步股票详情快照: limit={limit or 'all'}, offset={offset}, only_missing={only_missing}")
 
             try:
                 if only_missing:
-                    stocks = db.fetchall(
-                        """
+                    sql = """
                         SELECT stock_code, stock_name
                         FROM stocks
                         WHERE status = 1
                           AND (total_shares IS NULL OR float_shares IS NULL)
                         ORDER BY stock_code
-                        LIMIT ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    )
+                    """
                 else:
-                    stocks = db.fetchall(
-                        """
+                    sql = """
                         SELECT stock_code, stock_name
                         FROM stocks
                         WHERE status = 1
                         ORDER BY stock_code
-                        LIMIT ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    )
+                    """
+
+                if limit is None:
+                    if offset:
+                        stocks = db.fetchall(f"{sql}\nLIMIT -1 OFFSET ?", (offset,))
+                    else:
+                        stocks = db.fetchall(sql)
+                else:
+                    stocks = db.fetchall(f"{sql}\nLIMIT ? OFFSET ?", (limit, offset))
 
                 total = len(stocks)
                 reporter.update(
@@ -2620,7 +3694,7 @@ def sync_stock_list(manage_log: bool = True, trigger_profile_sync: Optional[bool
                 profile_sync_started = False
                 if trigger_profile_sync:
                     try:
-                        profile_sync_started = _launch_async_stock_profile_sync(limit=min(BATCH_SIZE, 20))
+                        profile_sync_started = _launch_async_stock_profile_sync(limit=min(BATCH_SIZE * 5, 500))
                     except Exception as e:
                         logger.warning(f"异步触发股票详情快照补充失败: {e}")
 
@@ -2671,7 +3745,7 @@ def sync_stock_list(manage_log: bool = True, trigger_profile_sync: Optional[bool
         raise
 
 
-def sync_adjust_factors(limit: int = BATCH_SIZE, offset: int = 0, manage_log: bool = True):
+def sync_adjust_factors(limit: Optional[int] = BATCH_SIZE, offset: int = 0, manage_log: bool = True):
     """同步复权因子"""
     try:
         with task_lock("adjust_factors") as task_handle:
@@ -2687,13 +3761,24 @@ def sync_adjust_factors(limit: int = BATCH_SIZE, offset: int = 0, manage_log: bo
                 offset=offset,
                 limit=limit,
             )
-            logger.info(f"开始同步复权因子: limit={limit}, offset={offset}")
+            logger.info(f"开始同步复权因子: limit={limit or 'all'}, offset={offset}")
 
             try:
-                stocks = db.fetchall(
-                    "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+                if limit is None:
+                    if offset:
+                        stocks = db.fetchall(
+                            "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT -1 OFFSET ?",
+                            (offset,),
+                        )
+                    else:
+                        stocks = db.fetchall(
+                            "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code"
+                        )
+                else:
+                    stocks = db.fetchall(
+                        "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    )
                 total = len(stocks)
                 success = 0
                 fail = 0
@@ -2754,7 +3839,7 @@ def sync_adjust_factors(limit: int = BATCH_SIZE, offset: int = 0, manage_log: bo
 
 
 def sync_corporate_actions(
-    limit: int = 20,
+    limit: Optional[int] = 20,
     offset: int = 0,
     years_back: int = 3,
     manage_log: bool = True,
@@ -2775,13 +3860,24 @@ def sync_corporate_actions(
                 limit=limit,
                 years_back=years_back,
             )
-            logger.info(f"开始同步公司行为: limit={limit}, offset={offset}, years_back={years_back}")
+            logger.info(f"开始同步公司行为: limit={limit or 'all'}, offset={offset}, years_back={years_back}")
 
             try:
-                stocks = db.fetchall(
-                    "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+                if limit is None:
+                    if offset:
+                        stocks = db.fetchall(
+                            "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT -1 OFFSET ?",
+                            (offset,),
+                        )
+                    else:
+                        stocks = db.fetchall(
+                            "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code"
+                        )
+                else:
+                    stocks = db.fetchall(
+                        "SELECT stock_code FROM stocks WHERE status = 1 ORDER BY stock_code LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    )
                 total = len(stocks)
                 success = 0
                 fail = 0
@@ -2839,6 +3935,105 @@ def sync_corporate_actions(
                 raise
     except TaskAlreadyRunningError as e:
         message = _task_running_message("公司行为同步", e)
+        logger.warning(message)
+        if manage_log:
+            return {"total": 0, "success": 0, "fail": 0, "skipped": True}
+        raise
+
+
+def sync_benchmark_index_kline(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    manage_log: bool = True,
+):
+    """同步评分卡和技术分析依赖的基准指数日线"""
+    try:
+        with task_lock("benchmark_index_kline") as task_handle:
+            log_id = log_sync_start("benchmark_index_kline") if manage_log else None
+            reporter = TaskProgressReporter("benchmark_index_kline", task_handle, log_id)
+            reporter.update(
+                force=True,
+                stage="初始化基准指数日线同步",
+                processed=0,
+                success=0,
+                fail=0,
+                total=len(BENCHMARK_INDEX_CODES),
+                start_date=start_date,
+                end_date=end_date,
+            )
+            logger.info(
+                f"开始同步基准指数日线: start_date={start_date or 'auto'}, end_date={end_date or 'today'}"
+            )
+
+            try:
+                _upsert_index_records(_benchmark_index_seed_records())
+                total = len(BENCHMARK_INDEX_CODES)
+                success = 0
+                fail = 0
+                processed = 0
+
+                for index_code in BENCHMARK_INDEX_CODES:
+                    fetch_start_date, fetch_end_date = _resolve_benchmark_kline_fetch_window(
+                        index_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    try:
+                        reporter.update(
+                            stage="抓取并写入基准指数日线",
+                            current_item=index_code,
+                            processed=processed,
+                            success=success,
+                            fail=fail,
+                            fetch_start_date=fetch_start_date,
+                            fetch_end_date=fetch_end_date,
+                            error_message=None,
+                        )
+                        kline_rows = _fetch_index_daily_kline_with_akshare(
+                            index_code,
+                            start_date=fetch_start_date,
+                            end_date=fetch_end_date,
+                        )
+                        if not kline_rows:
+                            raise RuntimeError("未获取到指数日线数据")
+
+                        _upsert_daily_kline_rows(index_code, kline_rows)
+                        success += 1
+                    except Exception as e:
+                        logger.error(f"{index_code} 基准指数日线同步失败: {e}")
+                        fail += 1
+                        reporter.update(current_item=index_code, error_message=str(e))
+                    finally:
+                        processed += 1
+                        reporter.update(
+                            current_item=index_code,
+                            processed=processed,
+                            success=success,
+                            fail=fail,
+                        )
+
+                reporter.update(
+                    force=True,
+                    stage="基准指数日线同步完成",
+                    total=total,
+                    processed=processed,
+                    success=success,
+                    fail=fail,
+                )
+                if manage_log:
+                    log_sync_end(log_id, "success", total, success, fail)
+                logger.info(f"基准指数日线同步完成: 总数{total}, 成功{success}, 失败{fail}")
+                return {"total": total, "success": success, "fail": fail}
+            except Exception as e:
+                reporter.update(force=True, stage="基准指数日线同步失败", error_message=str(e))
+                if manage_log:
+                    log_sync_end(log_id, "failed", error=str(e))
+                logger.error(f"基准指数日线同步失败: {e}")
+                if manage_log:
+                    return {"total": 0, "success": 0, "fail": 0}
+                raise
+    except TaskAlreadyRunningError as e:
+        message = _task_running_message("基准指数日线同步", e)
         logger.warning(message)
         if manage_log:
             return {"total": 0, "success": 0, "fail": 0, "skipped": True}
@@ -3167,6 +4362,26 @@ def sync_daily_kline(
                 if baostock_lock_acquired:
                     BAOSTOCK_SESSION_LOCK.release()
 
+                try:
+                    watchdog.mark_progress(
+                        context="刷新基准指数日线",
+                        force=True,
+                        stage="刷新基准指数日线",
+                        total=total,
+                        processed=processed,
+                        success=success,
+                        fail=fail,
+                        skipped=skipped,
+                        selection_mode=selection_mode,
+                    )
+                    sync_benchmark_index_kline(
+                        start_date=start_date,
+                        end_date=end_date,
+                        manage_log=False,
+                    )
+                except Exception as benchmark_error:
+                    logger.warning(f"基准指数日线刷新失败，继续刷新评分卡: {benchmark_error}")
+
                 scorecard_summary = None
                 try:
                     watchdog.mark_progress(
@@ -3184,6 +4399,23 @@ def sync_daily_kline(
                 except Exception as scorecard_error:
                     logger.warning(f"短线机会评分刷新失败，保留日线同步结果: {scorecard_error}")
 
+                market_overview_summary = None
+                try:
+                    watchdog.mark_progress(
+                        context="刷新市场结构缓存",
+                        force=True,
+                        stage="刷新市场结构缓存",
+                        total=total,
+                        processed=processed,
+                        success=success,
+                        fail=fail,
+                        skipped=skipped,
+                        selection_mode=selection_mode,
+                    )
+                    market_overview_summary = sync_market_overview_refresh(manage_log=False)
+                except Exception as market_overview_error:
+                    logger.warning(f"市场结构缓存刷新失败，保留日线同步结果: {market_overview_error}")
+
                 watchdog.mark_progress(
                     context="日线同步完成",
                     force=True,
@@ -3196,6 +4428,8 @@ def sync_daily_kline(
                     selection_mode=selection_mode,
                     factor_scorecard_updated_at=(scorecard_summary or {}).get("updated_at"),
                     factor_watchlist_count=(scorecard_summary or {}).get("watchlist_count"),
+                    market_overview_trade_date=(market_overview_summary or {}).get("trade_date"),
+                    market_overview_sector_count=(market_overview_summary or {}).get("sector_count"),
                 )
                 if manage_log:
                     log_sync_end(log_id, "success", total, success, fail)

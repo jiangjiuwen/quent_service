@@ -27,8 +27,8 @@ API_PORT = int(os.getenv("QUANT_API_PORT", "8000"))
 API_WORKERS = int(os.getenv("QUANT_API_WORKERS", "1"))
 
 # 同步配置
-SYNC_HOUR = int(os.getenv("QUANT_SYNC_HOUR", "15"))  # 每日同步时间（收盘后）
-SYNC_MINUTE = int(os.getenv("QUANT_SYNC_MINUTE", "30"))
+SYNC_HOUR = int(os.getenv("QUANT_SYNC_HOUR", "17"))  # 每日同步时间（收盘后）
+SYNC_MINUTE = int(os.getenv("QUANT_SYNC_MINUTE", "0"))
 BATCH_SIZE = int(os.getenv("QUANT_BATCH_SIZE", "100"))  # 每批处理股票数
 
 # 数据源配置

@@ -177,6 +177,7 @@ User=${PROD_SERVICE_USER}
 Group=${PROD_SERVICE_GROUP}
 WorkingDirectory=${PROD_APP_DIR}
 EnvironmentFile=${PROD_ENV_FILE}
+ExecStartPre=${PROD_VENV_DIR}/bin/python ${PROD_APP_DIR}/scripts/prod_migrate.py
 ExecStart=${PROD_VENV_DIR}/bin/python ${PROD_APP_DIR}/main.py
 Restart=always
 RestartSec=10
@@ -197,7 +198,7 @@ initialize_database() {
     (
         load_prod_env
         cd "${PROD_APP_DIR}"
-        "${PROD_VENV_DIR}/bin/python" -c 'from database.connection import db; db.init_tables()'
+        "${PROD_VENV_DIR}/bin/python" "${PROD_APP_DIR}/scripts/prod_migrate.py"
     )
 }
 

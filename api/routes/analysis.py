@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from api.models.schemas import APIResponse
 from services.factor_service import factor_service
+from services.market_overview_service import market_overview_service
 from services.technical_analysis_service import technical_analysis_service
 
 
@@ -44,5 +45,14 @@ async def get_stock_technical_analysis(stock_code: str):
         return APIResponse(data=data)
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/market-overview")
+async def get_market_overview():
+    """获取市场结构总览"""
+    try:
+        return APIResponse(data=market_overview_service.get_overview())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

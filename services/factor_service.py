@@ -4,6 +4,8 @@ import threading
 from datetime import datetime
 
 from database.connection import db
+from sync.task_dispatcher import spawn_sync_task
+from sync.task_locks import get_task_lock_status
 
 
 SCORECARD_LOOKBACK_BARS = 120
@@ -35,6 +37,7 @@ BENCHMARK_CANDIDATES = (
     "399905",
     "000905",
 )
+SCORECARD_REFRESH_TASK = "scorecard_refresh"
 
 
 def _to_float(value):
@@ -146,6 +149,69 @@ class FactorService:
     def _latest_kline_trade_date(self) -> str | None:
         return self._scalar("SELECT MAX(trade_date) AS value FROM daily_kline")
 
+    def _is_scorecard_current(self, state: dict, latest_trade_date: str | None) -> bool:
+        current_version = int(state.get("model_version") or 0)
+        return bool(
+            latest_trade_date
+            and int(state.get("total") or 0) > 0
+            and state.get("trade_date") == latest_trade_date
+            and current_version == SCORECARD_MODEL_VERSION
+        )
+
+    def _scorecard_status_payload(self, state: dict, latest_trade_date: str | None, **extra) -> dict:
+        payload = {
+            "trade_date": state.get("trade_date"),
+            "latest_market_trade_date": latest_trade_date,
+            "updated_at": state.get("updated_at"),
+            "total": int(state.get("total") or 0),
+            "watchlist_count": self.watchlist_count(min_score=WATCHLIST_MIN_SCORE),
+            "is_current": self._is_scorecard_current(state, latest_trade_date),
+            "is_stale": bool(int(state.get("total") or 0) > 0) and not self._is_scorecard_current(state, latest_trade_date),
+            "pending_refresh": False,
+            "refresh_reason": None,
+            "refresh_started_at": None,
+            "refresh_pid": None,
+        }
+        payload.update(extra)
+        return payload
+
+    def _schedule_scorecard_refresh(self) -> dict:
+        refresh_status = get_task_lock_status(SCORECARD_REFRESH_TASK)
+        refresh_metadata = refresh_status.get("metadata", {})
+        if refresh_status.get("is_running"):
+            return {
+                "pending_refresh": True,
+                "refresh_reason": "scorecard_refresh_running",
+                "refresh_started_at": refresh_metadata.get("started_at"),
+                "refresh_pid": refresh_metadata.get("pid"),
+            }
+
+        daily_status = get_task_lock_status("daily_kline")
+        daily_metadata = daily_status.get("metadata", {})
+        if daily_status.get("is_running"):
+            return {
+                "pending_refresh": True,
+                "refresh_reason": "daily_kline_running",
+                "refresh_started_at": daily_metadata.get("started_at"),
+                "refresh_pid": daily_metadata.get("pid"),
+            }
+
+        result = spawn_sync_task(SCORECARD_REFRESH_TASK)
+        if result.get("spawned"):
+            return {
+                "pending_refresh": True,
+                "refresh_reason": "scheduled",
+                "refresh_started_at": datetime.now().isoformat(timespec="seconds"),
+                "refresh_pid": result.get("pid"),
+            }
+
+        return {
+            "pending_refresh": False,
+            "refresh_reason": "schedule_failed",
+            "refresh_started_at": result.get("started_at"),
+            "refresh_pid": result.get("pid"),
+        }
+
     def _load_benchmark_snapshot(self, latest_trade_date: str | None) -> dict:
         if not latest_trade_date:
             return {}
@@ -181,39 +247,40 @@ class FactorService:
     def ensure_scorecard_current(self) -> dict:
         latest_trade_date = self._latest_kline_trade_date()
         if not latest_trade_date:
-            return {"refreshed": False, "trade_date": None, "total": 0, "watchlist_count": 0}
-
-        state = self._scorecard_state()
-        current_version = int(state.get("model_version") or 0)
-        if (
-            int(state.get("total") or 0) > 0
-            and state.get("trade_date") == latest_trade_date
-            and current_version == SCORECARD_MODEL_VERSION
-        ):
             return {
                 "refreshed": False,
-                "trade_date": state.get("trade_date"),
-                "updated_at": state.get("updated_at"),
-                "total": int(state.get("total") or 0),
-                "watchlist_count": self.watchlist_count(min_score=WATCHLIST_MIN_SCORE),
+                "trade_date": None,
+                "latest_market_trade_date": None,
+                "updated_at": None,
+                "total": 0,
+                "watchlist_count": 0,
+                "is_current": False,
+                "is_stale": False,
+                "pending_refresh": False,
+                "refresh_reason": "no_kline_data",
+                "refresh_started_at": None,
+                "refresh_pid": None,
             }
+
+        state = self._scorecard_state()
+        if self._is_scorecard_current(state, latest_trade_date):
+            return self._scorecard_status_payload(state, latest_trade_date, refreshed=False)
 
         with self._refresh_lock:
             state = self._scorecard_state()
-            current_version = int(state.get("model_version") or 0)
-            if (
-                int(state.get("total") or 0) > 0
-                and state.get("trade_date") == latest_trade_date
-                and current_version == SCORECARD_MODEL_VERSION
-            ):
-                return {
-                    "refreshed": False,
-                    "trade_date": state.get("trade_date"),
-                    "updated_at": state.get("updated_at"),
-                    "total": int(state.get("total") or 0),
-                    "watchlist_count": self.watchlist_count(min_score=WATCHLIST_MIN_SCORE),
-                }
-            return self.refresh_scorecard()
+            if self._is_scorecard_current(state, latest_trade_date):
+                return self._scorecard_status_payload(state, latest_trade_date, refreshed=False)
+
+            refresh_status = self._schedule_scorecard_refresh()
+            return self._scorecard_status_payload(
+                state,
+                latest_trade_date,
+                refreshed=False,
+                pending_refresh=refresh_status.get("pending_refresh", False),
+                refresh_reason=refresh_status.get("refresh_reason"),
+                refresh_started_at=refresh_status.get("refresh_started_at"),
+                refresh_pid=refresh_status.get("refresh_pid"),
+            )
 
     def refresh_scorecard(self) -> dict:
         latest_trade_date = self._latest_kline_trade_date()
@@ -662,7 +729,7 @@ class FactorService:
         return int(value or 0)
 
     def get_watchlist(self, limit: int = 12, min_score: int = WATCHLIST_MIN_SCORE) -> dict:
-        self.ensure_scorecard_current()
+        scorecard_status = self.ensure_scorecard_current()
         rows = db.fetchall(
             """
             SELECT
@@ -703,14 +770,20 @@ class FactorService:
         state = self._scorecard_state()
         return {
             "trade_date": state.get("trade_date"),
+            "latest_market_trade_date": scorecard_status.get("latest_market_trade_date"),
             "updated_at": state.get("updated_at"),
             "min_score": min_score,
             "count": self.watchlist_count(min_score=min_score),
+            "is_current": bool(scorecard_status.get("is_current")),
+            "is_stale": bool(scorecard_status.get("is_stale")),
+            "pending_refresh": bool(scorecard_status.get("pending_refresh")),
+            "refresh_reason": scorecard_status.get("refresh_reason"),
+            "refresh_started_at": scorecard_status.get("refresh_started_at"),
             "items": [self._summary_payload(row) for row in rows],
         }
 
     def get_stock_score(self, stock_code: str) -> dict | None:
-        self.ensure_scorecard_current()
+        scorecard_status = self.ensure_scorecard_current()
         row = db.fetchone(
             """
             SELECT *
@@ -720,8 +793,40 @@ class FactorService:
             (stock_code,),
         )
         if not row:
+            if scorecard_status.get("pending_refresh") or int(scorecard_status.get("total") or 0) == 0:
+                stock = db.fetchone(
+                    """
+                    SELECT stock_code, stock_name, market_type
+                    FROM stocks
+                    WHERE stock_code = ?
+                    """,
+                    (stock_code,),
+                ) or {"stock_code": stock_code, "stock_name": stock_code, "market_type": None}
+                return {
+                    "stock_code": stock.get("stock_code") or stock_code,
+                    "stock_name": stock.get("stock_name") or stock_code,
+                    "market_type": stock.get("market_type"),
+                    "trade_date": scorecard_status.get("trade_date"),
+                    "latest_market_trade_date": scorecard_status.get("latest_market_trade_date"),
+                    "updated_at": scorecard_status.get("updated_at"),
+                    "pending_refresh": True,
+                    "refresh_reason": scorecard_status.get("refresh_reason"),
+                    "refresh_started_at": scorecard_status.get("refresh_started_at"),
+                    "message": "短线机会评分正在后台刷新，请稍后重试。",
+                }
             return None
-        return self._detail_payload(row)
+        payload = self._detail_payload(row)
+        payload.update(
+            {
+                "latest_market_trade_date": scorecard_status.get("latest_market_trade_date"),
+                "is_current": bool(scorecard_status.get("is_current")),
+                "is_stale": bool(scorecard_status.get("is_stale")),
+                "pending_refresh": bool(scorecard_status.get("pending_refresh")),
+                "refresh_reason": scorecard_status.get("refresh_reason"),
+                "refresh_started_at": scorecard_status.get("refresh_started_at"),
+            }
+        )
+        return payload
 
     def _summary_payload(self, row: dict) -> dict:
         return {
