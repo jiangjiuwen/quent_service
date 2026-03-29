@@ -148,6 +148,29 @@ def spawn_latest_daily_sync(lookback_open_days: int = LATEST_DAILY_SYNC_LOOKBACK
     return result
 
 
+def spawn_missing_daily_sync(limit: int | None = None) -> dict:
+    """按真实缺口优先级触发日线补齐任务"""
+    kwargs: dict[str, int] = {}
+    if limit is not None:
+        kwargs["limit"] = max(int(limit), 1)
+
+    result = spawn_sync_task("daily_kline", **kwargs)
+    result.update(
+        {
+            "selection_mode": "gaps_first",
+            "limit": kwargs.get("limit"),
+        }
+    )
+    return result
+
+
+def spawn_full_refresh_sync() -> dict:
+    """触发全量补齐与更新任务"""
+    result = spawn_sync_task("full_refresh")
+    result.update({"selection_mode": "full_refresh"})
+    return result
+
+
 def trigger_scheduled_task(task_name: str, **kwargs: Any) -> None:
     """供 APScheduler 调用的计划任务派发器"""
     result = spawn_sync_task(task_name, **kwargs)

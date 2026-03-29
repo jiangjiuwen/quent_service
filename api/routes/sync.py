@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from api.models.schemas import APIResponse
 from services.query_service import QueryService
-from sync.task_dispatcher import spawn_latest_daily_sync
+from sync.task_dispatcher import spawn_full_refresh_sync, spawn_latest_daily_sync
 from sync.task_locks import get_task_lock_status
 
 router = APIRouter()
@@ -22,6 +22,14 @@ def task_conflict_response(task_name: str, label: str):
     detail_text = f" ({', '.join(detail_parts)})" if detail_parts else ""
     return APIResponse(code=409, message=f"{label}已在运行，暂不重复触发{detail_text}")
 
+
+def first_task_conflict(task_specs: list[tuple[str, str]]):
+    for task_name, label in task_specs:
+        conflict = task_conflict_response(task_name, label)
+        if conflict:
+            return conflict
+    return None
+
 @router.get("/status")
 async def get_sync_status():
     """获取同步任务状态"""
@@ -35,7 +43,12 @@ async def get_sync_status():
 async def trigger_daily_sync():
     """手动触发最近交易日的日线增量同步"""
     try:
-        conflict = task_conflict_response("daily_kline", "日线同步")
+        conflict = first_task_conflict(
+            [
+                ("daily_kline", "日线同步"),
+                ("full_refresh", "全量补齐更新"),
+            ]
+        )
         if conflict:
             return conflict
 
@@ -47,6 +60,32 @@ async def trigger_daily_sync():
 
         return APIResponse(
             message=f"最新日线同步任务已启动 ({result['start_date']} -> {result['end_date']})",
+            data=result,
+        )
+    except Exception as e:
+        return APIResponse(code=500, message=str(e))
+
+
+@router.post("/daily/missing")
+@router.post("/refresh-all")
+async def trigger_full_refresh_sync():
+    """手动触发全量补齐与更新"""
+    try:
+        conflict = first_task_conflict(
+            [
+                ("full_refresh", "全量补齐更新"),
+                ("daily_kline", "日线同步"),
+            ]
+        )
+        if conflict:
+            return conflict
+
+        result = spawn_full_refresh_sync()
+        if not result.get("spawned"):
+            return APIResponse(code=500, message="全量补齐更新任务未能启动")
+
+        return APIResponse(
+            message="全量补齐更新任务已启动（股票池/指数/财务/日线等将顺序刷新）",
             data=result,
         )
     except Exception as e:

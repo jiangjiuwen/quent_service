@@ -2,8 +2,24 @@ import time
 from datetime import date, datetime
 from typing import List, Optional, Tuple
 
-from database.connection import db
+from database.connection import TRACKED_TABLE_VOLUME_TARGETS, db
 from sync.task_locks import SINGLE_INSTANCE_SYNC_TASKS, get_task_lock_states
+
+SYNC_TASK_LABELS = {
+    "adjust_factors": "复权因子同步",
+    "benchmark_index_kline": "基准指数日线刷新",
+    "corporate_actions": "公司行为同步",
+    "daily_kline": "日线同步",
+    "financial": "财务同步",
+    "full_refresh": "全量补齐更新",
+    "index_list": "指数池同步",
+    "manual_snapshot": "手动快照",
+    "market_overview_refresh": "市场结构刷新",
+    "scorecard_refresh": "短线评分刷新",
+    "stock_list": "股票池同步",
+    "stock_profiles": "股票详情补齐",
+    "trading_calendar": "交易日历同步",
+}
 
 
 class QueryService:
@@ -97,6 +113,7 @@ class QueryService:
         return [
             {
                 "sync_type": row["sync_type"],
+                "label": SYNC_TASK_LABELS.get(row["sync_type"], row["sync_type"]),
                 "status": row.get("status"),
                 "last_time": row.get("last_time"),
             }
@@ -109,6 +126,7 @@ class QueryService:
             metadata = (state or {}).get("metadata") or {}
             payload[task_name] = {
                 "is_running": bool((state or {}).get("is_running")),
+                "label": SYNC_TASK_LABELS.get(task_name, task_name),
                 "metadata": {
                     "started_at": metadata.get("started_at"),
                     "updated_at": metadata.get("updated_at"),
@@ -117,6 +135,63 @@ class QueryService:
                 },
             }
         return payload
+
+    def _latest_table_volume_snapshot(self) -> dict:
+        def _build():
+            snapshot_head = db.fetchone(
+                """
+                SELECT snapshot_time, trade_date, trigger_sync_type, COUNT(*) AS tracked_tables
+                FROM table_volume_snapshots
+                WHERE snapshot_time = (
+                    SELECT MAX(snapshot_time)
+                    FROM table_volume_snapshots
+                )
+                GROUP BY snapshot_time, trade_date, trigger_sync_type
+                """
+            )
+            if not snapshot_head:
+                return {
+                    "snapshot_time": None,
+                    "trade_date": None,
+                    "trigger_sync_type": None,
+                    "trigger_sync_label": None,
+                    "tracked_tables": 0,
+                    "items": [],
+                    "counts": {},
+                }
+
+            rows = db.fetchall(
+                """
+                SELECT table_name, row_count
+                FROM table_volume_snapshots
+                WHERE snapshot_time = ?
+                """,
+                (snapshot_head["snapshot_time"],),
+            )
+            row_map = {row["table_name"]: int(row.get("row_count") or 0) for row in rows}
+            items = [
+                {
+                    "table_name": table_name,
+                    "table_label": table_label,
+                    "row_count": row_map.get(table_name),
+                }
+                for table_name, table_label in TRACKED_TABLE_VOLUME_TARGETS
+                if table_name in row_map
+            ]
+            return {
+                "snapshot_time": snapshot_head.get("snapshot_time"),
+                "trade_date": snapshot_head.get("trade_date"),
+                "trigger_sync_type": snapshot_head.get("trigger_sync_type"),
+                "trigger_sync_label": SYNC_TASK_LABELS.get(
+                    snapshot_head.get("trigger_sync_type"),
+                    snapshot_head.get("trigger_sync_type"),
+                ),
+                "tracked_tables": int(snapshot_head.get("tracked_tables") or 0),
+                "items": items,
+                "counts": row_map,
+            }
+
+        return self._cached("latest_table_volume_snapshot", 15, _build) or {}
 
     def get_stocks(
         self,
@@ -284,18 +359,6 @@ class QueryService:
         """
         return db.fetchone(sql, (stock_code,))
 
-    def _summary_table_counts(self) -> dict:
-        def _build():
-            return {
-                "total_stocks": int(self._scalar("SELECT COUNT(*) AS value FROM stocks WHERE status = 1") or 0),
-                "total_stock_records": int(self._scalar("SELECT COUNT(*) AS value FROM stocks") or 0),
-                "inactive_stock_records": int(self._scalar("SELECT COUNT(*) AS value FROM stocks WHERE status != 1") or 0),
-                "total_indices": int(self._scalar("SELECT COUNT(*) AS value FROM indices WHERE status = 1") or 0),
-                "total_kline_records": int(self._scalar("SELECT COUNT(*) AS value FROM daily_kline") or 0),
-            }
-
-        return self._cached("sync_status_summary_counts", 15, _build) or {}
-
     def get_sync_status(self) -> dict:
         """获取同步状态"""
         running_tasks = get_task_lock_states()
@@ -304,15 +367,16 @@ class QueryService:
         latest_sync_map = self._get_latest_sync_map()
         last_sync = self._sync_status_last_sync_payload(latest_sync_map)
         running_task_payload = self._sync_status_running_tasks_payload(running_tasks)
-        summary_counts = self._summary_table_counts()
-        total_stocks = int(summary_counts.get("total_stocks") or 0)
+        table_volume_snapshot = self._latest_table_volume_snapshot()
+        snapshot_counts = table_volume_snapshot.get("counts") or {}
         payload = {
             "last_sync": last_sync,
-            "total_stocks": total_stocks,
-            "total_stock_records": int(summary_counts.get("total_stock_records") or 0),
-            "inactive_stock_records": int(summary_counts.get("inactive_stock_records") or 0),
-            "total_indices": int(summary_counts.get("total_indices") or 0),
-            "total_kline_records": int(summary_counts.get("total_kline_records") or 0),
+            "total_stocks": snapshot_counts.get("stocks"),
+            "total_stock_records": snapshot_counts.get("stocks"),
+            "inactive_stock_records": None,
+            "total_indices": snapshot_counts.get("indices"),
+            "total_kline_records": snapshot_counts.get("daily_kline"),
+            "table_volume_snapshot": table_volume_snapshot,
             "running_tasks": running_task_payload,
         }
         return payload

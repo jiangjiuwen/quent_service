@@ -22,9 +22,16 @@
         </div>
         <div class="topbar-actions">
           <a class="ghost-button" href="/docs" target="_blank" rel="noreferrer">API 文档</a>
-          <button class="ghost-button" id="refreshAllBtn" type="button">刷新数据</button>
-          <button class="primary-button" id="syncDailyBtn" type="button">同步最新日线</button>
-          <span class="topbar-status" id="actionMessage">自动日更</span>
+          <button class="ghost-button" id="syncMissingBtn" type="button">补齐并更新数据</button>
+          <button class="ghost-button" id="syncDailyBtn" type="button">同步最新日线</button>
+          <div class="topbar-status-tag">
+            <span class="topbar-status-tag-label">同步模式</span>
+            <strong id="actionMessage">自动日更</strong>
+          </div>
+          <div class="topbar-status-tag">
+            <span class="topbar-status-tag-label">运行状态</span>
+            <strong id="healthText">检查中</strong>
+          </div>
         </div>
       </nav>
 
@@ -42,21 +49,13 @@
             <div>
               <p class="panel-kicker">Control Deck</p>
               <h3>服务与数据总览</h3>
-              <p class="hero-side-copy">总量指标和关键状态集中展示，先看健康度与同步结果，再看库内规模。</p>
+              <p class="hero-side-copy">优先展示任务状态与最近一次同步后的数据快照，避免页面刷新时再做高成本统计。</p>
             </div>
             <div class="hero-side-status">
               <div class="meta-chip hero-side-status-chip">
-                <span class="meta-chip-label">运行状态</span>
-                <strong id="healthText">检查中</strong>
-              </div>
-              <div class="meta-chip hero-side-status-chip">
-                <span class="meta-chip-label">日线同步</span>
-                <strong id="dailySyncStatus">-</strong>
-                <small id="dailySyncTime">等待数据</small>
-              </div>
-              <div class="meta-chip hero-side-status-chip">
                 <span class="meta-chip-label">运行任务</span>
                 <strong id="runningTaskSummary">当前空闲</strong>
+                <small id="runningTaskDetail">无执行中的同步任务</small>
               </div>
             </div>
           </div>
@@ -64,31 +63,18 @@
           <section class="hero-side-section">
             <div class="hero-side-section-head">
               <div>
-                <p class="hero-side-section-label">Inventory</p>
-                <h4>当前库规模</h4>
+                <p class="hero-side-section-label">Snapshot</p>
+                <h4>全表快照</h4>
               </div>
-              <span class="hero-side-section-note">总量信息单独看</span>
+              <span class="hero-side-section-note">单卡片摘要</span>
             </div>
-            <div class="metric-grid metric-grid-secondary">
-              <article class="metric-card metric-card-compact">
-                <span>股票池</span>
-                <strong id="stockCount">-</strong>
-                <small id="stockCountNote">总 / 活跃 / 非活跃</small>
-              </article>
-              <article class="metric-card metric-card-compact">
-                <span>指数池</span>
-                <strong id="indexCount">-</strong>
-                <small>独立指数记录</small>
-              </article>
-              <article class="metric-card metric-card-compact">
-                <span>日线记录</span>
-                <strong id="klineCount">-</strong>
-                <small id="klineCountNote">当前库内行情条数</small>
-              </article>
-              <article class="metric-card metric-card-compact">
-                <span>运行任务</span>
-                <strong id="runningTaskCount">-</strong>
-                <small>后台执行中的任务</small>
+            <div class="sync-snapshot-grid" id="tableVolumeGrid">
+              <article class="snapshot-summary-card snapshot-summary-empty">
+                <div class="snapshot-summary-head">
+                  <strong id="tableVolumeTitle">暂无快照</strong>
+                  <small id="tableVolumeMeta">等待同步任务完成后自动记录</small>
+                </div>
+                <div class="snapshot-summary-body" id="tableVolumeSummary">等待同步任务完成后自动记录。</div>
               </article>
             </div>
           </section>
@@ -101,32 +87,32 @@
     <main class="dashboard">
       <section class="main-column">
         <section class="panel chart-panel reveal">
-          <div class="chart-search-stack">
-            <form class="search-form" id="searchForm">
-              <label class="search-box" for="searchInput">
-                <span class="search-label">定位股票</span>
-                <input id="searchInput" name="search" autocomplete="off" placeholder="输入代码或名称，例如 000001 / 平安银行">
-              </label>
-              <button class="primary-button" type="submit">查看</button>
-            </form>
-
-            <div class="suggestions" id="suggestions" hidden></div>
-          </div>
-
-          <div class="panel-header">
-            <div>
+          <div class="panel-header chart-panel-head">
+            <div class="chart-panel-head-main">
               <p class="panel-kicker">趋势雷达</p>
-              <h3 id="stockTitle">载入中</h3>
-              <p id="stockSubtitle" class="muted">正在读取股票基本信息</p>
+              <div class="chart-title-row">
+                <h3 id="stockTitle">载入中</h3>
+                <p id="stockSubtitle" class="muted">正在读取股票基本信息</p>
+              </div>
             </div>
-            <div class="price-badge" id="priceBadge">
-              <span class="price-badge-label">最新价</span>
-              <strong id="latestPrice">-</strong>
-              <small id="latestChange">等待数据</small>
+
+            <div class="chart-search-stack chart-search-inline">
+              <form class="search-form search-form-inline" id="searchForm">
+                <label class="search-box search-box-inline" for="searchInput">
+                  <input id="searchInput" name="search" autocomplete="off" placeholder="搜索代码或名称，例如 000001 / 平安银行">
+                </label>
+              </form>
+
+              <div class="suggestions" id="suggestions" hidden></div>
             </div>
           </div>
 
           <div class="chart-stats">
+            <div class="stat-tile stat-tile-price price-badge" id="priceBadge">
+              <span class="price-badge-label">最新价</span>
+              <strong id="latestPrice">-</strong>
+              <small id="latestChange">等待数据</small>
+            </div>
             <div class="stat-tile">
               <span>已载入区间</span>
               <strong id="loadedRange">-</strong>
@@ -250,18 +236,6 @@
           </div>
           <div id="watchlist" class="watchlist"></div>
         </section>
-
-        <section class="panel market-overview-panel reveal">
-          <div class="panel-header compact">
-            <div>
-              <p class="panel-kicker">Market Structure</p>
-              <h3>市场结构</h3>
-            </div>
-          </div>
-          <div id="marketOverview" class="market-overview">
-            <div class="placeholder-card">市场结构加载中。</div>
-          </div>
-        </section>
         
         <section class="panel financial-panel reveal">
           <div class="panel-header compact">
@@ -284,6 +258,18 @@
           </div>
           <div id="technicalAnalysis" class="technical-analysis">
             <div class="placeholder-card">技术面分析加载中。</div>
+          </div>
+        </section>
+
+        <section class="panel market-overview-panel reveal">
+          <div class="panel-header compact">
+            <div>
+              <p class="panel-kicker">Market Structure</p>
+              <h3>市场结构</h3>
+            </div>
+          </div>
+          <div id="marketOverview" class="market-overview">
+            <div class="placeholder-card">市场结构加载中。</div>
           </div>
         </section>
       </section>

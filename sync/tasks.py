@@ -11,7 +11,7 @@ import time
 from typing import Optional
 
 from config.settings import BATCH_SIZE, rolling_history_start_text
-from database.connection import db
+from database.connection import TRACKED_TABLE_VOLUME_TARGETS, db
 from services.factor_service import factor_service
 from sync.task_dispatcher import spawn_sync_task
 from sync.task_locks import TaskAlreadyRunningError, task_lock
@@ -2742,6 +2742,60 @@ def _replace_sector_fund_flow_rows(trade_date: str, sector_type: str, rows: list
         )
 
 
+def _record_table_volume_snapshot(
+    trigger_sync_type: str,
+    trade_date: Optional[str] = None,
+) -> dict:
+    snapshot_time = datetime.now().isoformat(timespec="microseconds")
+    resolved_trade_date = trade_date or (
+        db.fetchone("SELECT MAX(trade_date) AS value FROM daily_kline") or {}
+    ).get("value")
+    items = []
+
+    with db.get_connection() as conn:
+        for table_name, table_label in TRACKED_TABLE_VOLUME_TARGETS:
+            row = conn.execute(f'SELECT COUNT(*) AS value FROM "{table_name}"').fetchone()
+            row_count = int((dict(row) if row else {}).get("value") or 0)
+            items.append(
+                {
+                    "snapshot_time": snapshot_time,
+                    "trade_date": resolved_trade_date,
+                    "trigger_sync_type": trigger_sync_type,
+                    "table_name": table_name,
+                    "table_label": table_label,
+                    "row_count": row_count,
+                }
+            )
+
+        conn.executemany(
+            """
+            INSERT INTO table_volume_snapshots (
+                snapshot_time, trade_date, trigger_sync_type, table_name, row_count
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["snapshot_time"],
+                    item["trade_date"],
+                    item["trigger_sync_type"],
+                    item["table_name"],
+                    item["row_count"],
+                )
+                for item in items
+            ],
+        )
+
+    return {
+        "snapshot_time": snapshot_time,
+        "trade_date": resolved_trade_date,
+        "trigger_sync_type": trigger_sync_type,
+        "table_count": len(items),
+        "total_rows": sum(item["row_count"] for item in items),
+        "items": items,
+    }
+
+
 def _fetch_market_fund_flow_with_akshare() -> list[dict]:
     import akshare as ak
 
@@ -3381,6 +3435,229 @@ def sync_market_overview_refresh(manage_log: bool = True):
         logger.warning(message)
         if manage_log:
             return {"trade_date": None, "sentiment_days": 0, "sector_count": 0, "event_count": 0, "skipped": True}
+        raise
+
+
+def sync_full_refresh(manage_log: bool = True):
+    """顺序补齐并更新主要数据表，适合作为一次性全量维护入口"""
+    try:
+        with task_lock("full_refresh") as task_handle:
+            log_id = log_sync_start("full_refresh") if manage_log else None
+            reporter = TaskProgressReporter("full_refresh", task_handle, log_id)
+            stage_specs = [
+                {
+                    "task_name": "trading_calendar",
+                    "label": "同步交易日历",
+                    "runner": sync_trade_calendar,
+                    "kwargs": {},
+                },
+                {
+                    "task_name": "stock_list",
+                    "label": "同步股票池",
+                    "runner": sync_stock_list,
+                    "kwargs": {"trigger_profile_sync": False},
+                },
+                {
+                    "task_name": "index_list",
+                    "label": "同步指数池",
+                    "runner": sync_index_list,
+                    "kwargs": {},
+                },
+                {
+                    "task_name": "stock_profiles",
+                    "label": "补齐股票详情快照",
+                    "runner": sync_stock_profiles,
+                    "kwargs": {"limit": None, "offset": 0, "only_missing": True},
+                },
+                {
+                    "task_name": "daily_kline",
+                    "label": "补齐日线缺口并刷新衍生缓存",
+                    "runner": sync_daily_kline,
+                    "kwargs": {"limit": None, "offset": 0},
+                },
+                {
+                    "task_name": "adjust_factors",
+                    "label": "同步复权因子",
+                    "runner": sync_adjust_factors,
+                    "kwargs": {"limit": None, "offset": 0},
+                },
+                {
+                    "task_name": "corporate_actions",
+                    "label": "同步公司行为",
+                    "runner": sync_corporate_actions,
+                    "kwargs": {"limit": None, "offset": 0, "years_back": 3},
+                },
+                {
+                    "task_name": "financial",
+                    "label": "同步财务报表",
+                    "runner": sync_financial_data,
+                    "kwargs": {"limit": None, "offset": 0, "only_missing": False},
+                },
+                {
+                    "task_name": "scorecard_refresh",
+                    "label": "刷新短线评分卡",
+                    "runner": sync_scorecard_refresh,
+                    "kwargs": {},
+                },
+                {
+                    "task_name": "market_overview_refresh",
+                    "label": "刷新市场结构缓存",
+                    "runner": sync_market_overview_refresh,
+                    "kwargs": {},
+                },
+            ]
+            total_steps = len(stage_specs)
+            success_steps = 0
+            fail_steps = 0
+            skipped_steps = 0
+            step_results = []
+            failure_messages = []
+
+            reporter.update(
+                force=True,
+                stage="初始化全量补齐更新",
+                total=total_steps,
+                processed=0,
+                success=0,
+                fail=0,
+                skipped=0,
+            )
+            logger.info("开始执行全量补齐更新任务...")
+
+            for index, spec in enumerate(stage_specs, start=1):
+                step_label = spec["label"]
+                step_task_name = spec["task_name"]
+                reporter.update(
+                    force=True,
+                    stage=step_label,
+                    current_item=step_task_name,
+                    current_name=step_label,
+                    total=total_steps,
+                    processed=index - 1,
+                    success=success_steps,
+                    fail=fail_steps,
+                    skipped=skipped_steps,
+                    error_message=None,
+                )
+                logger.info(f"全量补齐更新阶段开始: {step_label}")
+
+                step_status = "success"
+                step_message = None
+                step_result = None
+                try:
+                    step_result = spec["runner"](manage_log=False, **spec["kwargs"])
+                    if isinstance(step_result, dict) and step_result.get("skipped"):
+                        step_status = "skipped"
+                        skipped_steps += 1
+                        step_message = f"{step_label}已在运行，跳过重复触发"
+                        logger.warning(step_message)
+                    else:
+                        success_steps += 1
+                        logger.info(f"全量补齐更新阶段完成: {step_label}")
+                except TaskAlreadyRunningError as exc:
+                    step_status = "skipped"
+                    skipped_steps += 1
+                    step_message = _task_running_message(step_label, exc)
+                    logger.warning(step_message)
+                except Exception as exc:
+                    step_status = "failed"
+                    fail_steps += 1
+                    step_message = str(exc)
+                    failure_messages.append(f"{step_label}: {exc}")
+                    logger.warning(f"全量补齐更新阶段失败，继续后续阶段: {step_label}, error={exc}")
+
+                step_results.append(
+                    {
+                        "task_name": step_task_name,
+                        "label": step_label,
+                        "status": step_status,
+                        "message": step_message,
+                        "result": step_result,
+                    }
+                )
+                reporter.update(
+                    force=True,
+                    stage=step_label,
+                    current_item=step_task_name,
+                    current_name=step_label,
+                    total=total_steps,
+                    processed=index,
+                    success=success_steps,
+                    fail=fail_steps,
+                    skipped=skipped_steps,
+                    last_stage=step_label,
+                    last_stage_status=step_status,
+                    error_message=step_message if step_status == "failed" else None,
+                )
+
+            final_status = "success" if fail_steps == 0 else "failed"
+            final_stage = "全量补齐更新完成" if fail_steps == 0 else "全量补齐更新完成（部分失败）"
+            table_volume_snapshot = None
+            try:
+                reporter.update(
+                    force=True,
+                    stage="记录表规模快照",
+                    total=total_steps,
+                    processed=total_steps,
+                    success=success_steps,
+                    fail=fail_steps,
+                    skipped=skipped_steps,
+                    error_message=None,
+                )
+                table_volume_snapshot = _record_table_volume_snapshot("full_refresh")
+            except Exception as table_snapshot_error:
+                failure_messages.append(f"记录表规模快照: {table_snapshot_error}")
+                fail_steps += 1
+                final_status = "failed"
+                final_stage = "全量补齐更新完成（部分失败）"
+                logger.warning(f"全量补齐更新记录表规模快照失败: {table_snapshot_error}")
+
+            summary = {
+                "total_steps": total_steps,
+                "success_steps": success_steps,
+                "fail_steps": fail_steps,
+                "skipped_steps": skipped_steps,
+                "steps": step_results,
+                "table_volume_snapshot_time": (table_volume_snapshot or {}).get("snapshot_time"),
+            }
+            reporter.update(
+                force=True,
+                stage=final_stage,
+                total=total_steps,
+                processed=total_steps,
+                success=success_steps,
+                fail=fail_steps,
+                skipped=skipped_steps,
+                table_volume_snapshot_time=(table_volume_snapshot or {}).get("snapshot_time"),
+                table_volume_snapshot_table_count=(table_volume_snapshot or {}).get("table_count"),
+                error_message="; ".join(failure_messages) if failure_messages else None,
+            )
+            if manage_log:
+                log_sync_end(
+                    log_id,
+                    final_status,
+                    total_steps,
+                    success_steps,
+                    fail_steps,
+                    error="; ".join(failure_messages) if failure_messages else None,
+                )
+            logger.info(
+                f"全量补齐更新任务结束: total_steps={total_steps}, "
+                f"success_steps={success_steps}, fail_steps={fail_steps}, skipped_steps={skipped_steps}"
+            )
+            return summary
+    except TaskAlreadyRunningError as e:
+        message = _task_running_message("全量补齐更新", e)
+        logger.warning(message)
+        if manage_log:
+            return {
+                "total_steps": 0,
+                "success_steps": 0,
+                "fail_steps": 0,
+                "skipped_steps": 1,
+                "steps": [],
+                "skipped": True,
+            }
         raise
 
 
@@ -4416,6 +4693,26 @@ def sync_daily_kline(
                 except Exception as market_overview_error:
                     logger.warning(f"市场结构缓存刷新失败，保留日线同步结果: {market_overview_error}")
 
+                table_volume_snapshot = None
+                try:
+                    watchdog.mark_progress(
+                        context="记录表规模快照",
+                        force=True,
+                        stage="记录表规模快照",
+                        total=total,
+                        processed=processed,
+                        success=success,
+                        fail=fail,
+                        skipped=skipped,
+                        selection_mode=selection_mode,
+                    )
+                    table_volume_snapshot = _record_table_volume_snapshot(
+                        "daily_kline",
+                        trade_date=(market_overview_summary or {}).get("trade_date") or (scorecard_summary or {}).get("trade_date"),
+                    )
+                except Exception as table_snapshot_error:
+                    logger.warning(f"表规模快照记录失败，保留日线同步结果: {table_snapshot_error}")
+
                 watchdog.mark_progress(
                     context="日线同步完成",
                     force=True,
@@ -4430,6 +4727,8 @@ def sync_daily_kline(
                     factor_watchlist_count=(scorecard_summary or {}).get("watchlist_count"),
                     market_overview_trade_date=(market_overview_summary or {}).get("trade_date"),
                     market_overview_sector_count=(market_overview_summary or {}).get("sector_count"),
+                    table_volume_snapshot_time=(table_volume_snapshot or {}).get("snapshot_time"),
+                    table_volume_snapshot_table_count=(table_volume_snapshot or {}).get("table_count"),
                 )
                 if manage_log:
                     log_sync_end(log_id, "success", total, success, fail)

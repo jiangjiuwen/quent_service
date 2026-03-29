@@ -4,6 +4,27 @@ from config.settings import DB_PATH
 
 SQLITE_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000
+TRACKED_TABLE_VOLUME_TARGETS = (
+    ("stocks", "股票池"),
+    ("indices", "指数池"),
+    ("industries", "行业分类"),
+    ("industry_membership_history", "行业归属历史"),
+    ("trading_calendar", "交易日历"),
+    ("share_capital_history", "股本历史"),
+    ("daily_kline", "日线行情"),
+    ("daily_trade_flags", "交易状态"),
+    ("adjust_factors", "复权因子"),
+    ("corporate_actions", "公司行为"),
+    ("daily_valuation_snapshot", "估值快照"),
+    ("financial_reports", "财务报表"),
+    ("stock_factor_scores", "短线评分"),
+    ("market_sentiment_daily", "市场情绪"),
+    ("sector_strength_daily", "行业强度"),
+    ("stock_event_signals_daily", "事件信号"),
+    ("market_fund_flow_daily", "市场资金流"),
+    ("sector_fund_flow_daily", "行业资金流"),
+    ("sync_logs", "同步日志"),
+)
 
 
 class Database:
@@ -446,6 +467,17 @@ class Database:
             PRIMARY KEY (trade_date, sector_type, sector_name)
         );
 
+        -- 表规模快照
+        CREATE TABLE IF NOT EXISTS table_volume_snapshots (
+            snapshot_time TIMESTAMP NOT NULL,
+            trade_date DATE,
+            trigger_sync_type VARCHAR(32) NOT NULL,
+            table_name VARCHAR(64) NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (snapshot_time, table_name)
+        );
+
         -- 同步日志表
         CREATE TABLE IF NOT EXISTS sync_logs (
             log_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -524,6 +556,12 @@ class Database:
 
         CREATE INDEX IF NOT EXISTS idx_sector_fund_flow_rank
             ON sector_fund_flow_daily(trade_date, sector_type, rank_no);
+
+        CREATE INDEX IF NOT EXISTS idx_table_volume_snapshot_time
+            ON table_volume_snapshots(snapshot_time DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_table_volume_snapshot_trade_date
+            ON table_volume_snapshots(trade_date, trigger_sync_type);
 
         CREATE INDEX IF NOT EXISTS idx_sync_type ON sync_logs(sync_type);
         CREATE INDEX IF NOT EXISTS idx_sync_status ON sync_logs(status);

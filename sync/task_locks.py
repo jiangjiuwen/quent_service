@@ -14,6 +14,7 @@ SINGLE_INSTANCE_SYNC_TASKS = (
     "corporate_actions",
     "daily_kline",
     "financial",
+    "full_refresh",
     "index_list",
     "market_overview_refresh",
     "scorecard_refresh",

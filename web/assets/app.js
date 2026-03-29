@@ -13,6 +13,7 @@ const api = {
   health: "/health",
   syncStatus: "/api/v1/sync/status",
   syncDaily: "/api/v1/sync/daily",
+  syncFullRefresh: "/api/v1/sync/refresh-all",
   analysisScorecard: "/api/v1/analysis/scorecard",
   analysisScoreDetail: (code) => `/api/v1/analysis/scorecard/${code}`,
   analysisMarketOverview: "/api/v1/analysis/market-overview",
@@ -42,7 +43,6 @@ const CHART_COLORS = {
 };
 
 const state = {
-  totalStocks: 0,
   selectedCode: "000001",
   searchTimer: null,
   searchAbortController: null,
@@ -269,13 +269,18 @@ function isTaskBusy(taskName) {
 }
 
 function updateTaskControls() {
-  const button = $("syncDailyBtn");
-  if (!button) {
+  const dailyButton = $("syncDailyBtn");
+  const missingButton = $("syncMissingBtn");
+  if (!dailyButton || !missingButton) {
     return;
   }
-  const busy = isTaskBusy("daily_kline");
-  button.disabled = busy;
-  button.textContent = busy ? "同步中..." : "同步最新日线";
+  const dailyBusy = isTaskBusy("daily_kline");
+  const fullRefreshBusy = isTaskBusy("full_refresh");
+  const busy = dailyBusy || fullRefreshBusy;
+  dailyButton.disabled = busy;
+  missingButton.disabled = busy;
+  dailyButton.textContent = dailyBusy ? "同步中..." : fullRefreshBusy ? "更新中..." : "同步最新日线";
+  missingButton.textContent = fullRefreshBusy ? "更新中..." : dailyBusy ? "日线同步中..." : "补齐并更新数据";
 }
 
 function priceToneClass(change) {
@@ -296,25 +301,6 @@ function applyToneClass(element, value) {
   }
 }
 
-function formatTaskStatus(status, isRunning = false) {
-  if (isRunning || status === "running") {
-    return "运行中";
-  }
-  if (status === "success") {
-    return "正常";
-  }
-  if (status === "failed") {
-    return "失败";
-  }
-  if (status === "aborted") {
-    return "已终止";
-  }
-  if (status === "idle") {
-    return "待执行";
-  }
-  return status || "未执行";
-}
-
 async function loadHealth() {
   try {
     const data = await fetchJson(api.health);
@@ -324,61 +310,104 @@ async function loadHealth() {
   }
 }
 
-function extractSyncItem(lastSync, type) {
-  return (lastSync || []).find((item) => item.sync_type === type);
+function getRunningTaskEntries(runningTasks) {
+  return Object.entries(runningTasks || {})
+    .filter(([, item]) => item?.is_running)
+    .map(([taskName, item]) => ({
+      taskName,
+      label: item?.label || taskName,
+    }));
 }
 
-function formatRunningTaskSummary(lockState) {
-  const metadata = lockState?.metadata || {};
-  const total = parseNullableNumber(metadata.total);
-  const processed = parseNullableNumber(metadata.processed);
-  if (total !== null && processed !== null) {
-    return `${numberFormatter.format(processed)}/${numberFormatter.format(total)}`;
+function formatRunningTaskNames(runningTaskEntries) {
+  if (!runningTaskEntries.length) {
+    return "当前空闲";
   }
-  return formatDateTime(metadata.updated_at || metadata.started_at);
+  return runningTaskEntries.map((item) => item.label).join(" / ");
+}
+
+function renderTableVolumeSnapshot(snapshot) {
+  const cardEl = document.querySelector("#tableVolumeGrid .snapshot-summary-card");
+  const titleEl = $("tableVolumeTitle");
+  const metaEl = $("tableVolumeMeta");
+  const summaryEl = $("tableVolumeSummary");
+  const gridEl = $("tableVolumeGrid");
+  if (!cardEl || !titleEl || !metaEl || !summaryEl || !gridEl) {
+    return;
+  }
+
+  const items = Array.isArray(snapshot?.items)
+    ? snapshot.items.filter((item) => hasValue(item?.row_count))
+    : [];
+
+  if (!items.length) {
+    titleEl.textContent = "暂无快照";
+    metaEl.textContent = "等待同步任务完成后自动记录";
+    summaryEl.textContent = "等待同步任务完成后自动记录。";
+    gridEl.innerHTML = "";
+    gridEl.append(cardEl);
+    return;
+  }
+
+  const metaParts = [];
+  if (snapshot?.trade_date) {
+    metaParts.push(`交易日 ${escapeHtml(snapshot.trade_date)}`);
+  }
+  if (snapshot?.trigger_sync_label) {
+    metaParts.push(escapeHtml(snapshot.trigger_sync_label));
+  }
+  if (snapshot?.snapshot_time) {
+    metaParts.push(formatDateTime(snapshot.snapshot_time));
+  }
+  const summaryMarkup = items
+    .map((item) => {
+      const rowCount = parseNullableNumber(item.row_count) || 0;
+      return `
+        <span class="snapshot-summary-pill">
+          <span class="snapshot-summary-pill-label">${escapeHtml(item.table_label || item.table_name)}</span>
+          <strong class="snapshot-summary-pill-value">${formatCompact(rowCount)}</strong>
+        </span>
+      `;
+    })
+    .join("");
+
+  titleEl.textContent = "最近同步数据量";
+  metaEl.textContent = metaParts.join(" · ") || "最近一次同步快照";
+  summaryEl.innerHTML = summaryMarkup;
+  gridEl.innerHTML = "";
+  gridEl.append(cardEl);
 }
 
 function applySyncSummaryPayload(payload) {
-  state.totalStocks = payload.total_stocks || 0;
+  const snapshot = payload.table_volume_snapshot || {};
+  const runningTaskEntries = getRunningTaskEntries(payload.running_tasks);
+  const runningTaskNames = formatRunningTaskNames(runningTaskEntries);
   state.runningTasks = payload.running_tasks || {};
   updateTaskControls();
 
   const summarySignature = JSON.stringify({
-    total_stocks: payload.total_stocks || 0,
-    total_stock_records: payload.total_stock_records || 0,
-    inactive_stock_records: payload.inactive_stock_records || 0,
-    total_indices: payload.total_indices || 0,
-    total_kline_records: payload.total_kline_records || 0,
-    running_tasks: payload.running_tasks || {},
-    last_sync: payload.last_sync || [],
+    snapshot_time: snapshot.snapshot_time || null,
+    snapshot_trade_date: snapshot.trade_date || null,
+    snapshot_counts: snapshot.counts || {},
+    running_tasks: runningTaskEntries,
+    last_sync: (payload.last_sync || []).map((item) => ({
+      sync_type: item.sync_type,
+      status: item.status,
+      last_time: item.last_time,
+    })),
   });
   if (summarySignature === state.syncSummarySignature) {
     return;
   }
   state.syncSummarySignature = summarySignature;
 
-  const runningTaskCount = Object.values(payload.running_tasks || {}).filter((item) => item.is_running).length;
-  const totalStockRecords = parseNullableNumber(payload.total_stock_records);
-  const inactiveStockRecords = parseNullableNumber(payload.inactive_stock_records);
-  const displayedStockRecords = totalStockRecords ?? payload.total_stocks ?? 0;
-  const parsedWindowKlineRecords = parseNullableNumber(payload.total_kline_records);
+  const runningTaskCount = runningTaskEntries.length;
 
-  $("stockCount").textContent = numberFormatter.format(displayedStockRecords);
-  $("stockCountNote").textContent = `活跃 ${numberFormatter.format(payload.total_stocks || 0)} / 非活跃 ${numberFormatter.format(inactiveStockRecords || 0)}`;
-  $("indexCount").textContent = numberFormatter.format(payload.total_indices || 0);
-  $("klineCount").textContent = parsedWindowKlineRecords === null ? "--" : formatCompact(parsedWindowKlineRecords);
-  $("klineCountNote").textContent = `当前库内 ${numberFormatter.format(parsedWindowKlineRecords || 0)} 条`;
-  $("runningTaskCount").textContent = numberFormatter.format(runningTaskCount);
-  $("runningTaskSummary").textContent = runningTaskCount ? `${runningTaskCount} 个任务运行中` : "当前空闲";
-
-  const dailySync = extractSyncItem(payload.last_sync, "daily_kline");
-  const dailyRunningState = payload.running_tasks?.daily_kline;
-  const dailyRunning = dailyRunningState?.is_running;
-
-  $("dailySyncStatus").textContent = formatTaskStatus(dailySync?.status, dailyRunning);
-  $("dailySyncTime").textContent = dailyRunning
-    ? formatRunningTaskSummary(dailyRunningState)
-    : formatDateTime(dailySync?.last_time);
+  $("runningTaskSummary").textContent = runningTaskNames;
+  $("runningTaskDetail").textContent = runningTaskCount
+    ? `共 ${numberFormatter.format(runningTaskCount)} 个任务`
+    : "无执行中的同步任务";
+  renderTableVolumeSnapshot(snapshot);
 }
 
 async function loadSyncSummary() {
@@ -1436,12 +1465,14 @@ function renderObservationPool(data) {
 
   container.innerHTML = items
     .map(
-      (item) => `
+      (item, index) => `
         <button class="watchlist-item" type="button" data-code="${item.stock_code}">
           <div class="watchlist-head">
-            <span>
-              <strong class="watchlist-name">${escapeHtml(item.stock_name)}</strong>
-              <small class="watchlist-code">${item.stock_code} · ${escapeHtml(item.market_type || "--")}</small>
+            <span class="watchlist-meta">
+              <span class="watchlist-title-line">
+                <strong class="watchlist-rank">#${index + 1}</strong>
+                <strong class="watchlist-name">${escapeHtml(item.stock_name)} <span class="watchlist-inline-code">${item.stock_code} · ${escapeHtml(item.market_type || "--")}</span></strong>
+              </span>
             </span>
             <strong class="factor-score-total ${item.trigger_ready ? "positive" : ""}">${numberFormatter.format(item.total_score || 0)} / 10</strong>
           </div>
@@ -1502,6 +1533,19 @@ function renderMarketOverview(data) {
   const benchmarks = data.benchmarks || [];
   const sectors = data.sectors || [];
   const fundIndustries = data.fund_flow?.industries || [];
+  const benchmarkTags = benchmarks.length
+    ? benchmarks
+        .map(
+          (item) => `
+            <span class="financial-item overview-benchmark-tag ${Number(item.pct_change || 0) > 0 ? "positive" : Number(item.pct_change || 0) < 0 ? "negative" : ""}">
+              <span>${escapeHtml(item.index_name || item.index_code)}</span>
+              <strong class="overview-benchmark-change ${priceToneClass(item.pct_change)}">${formatSignedPercent(item.pct_change)}</strong>
+              <small>5日 ${formatSignedDecimalPercent(item.return_5d)}</small>
+            </span>
+          `
+        )
+        .join("")
+    : `<span class="financial-item overview-benchmark-tag overview-benchmark-tag-muted">暂无指数强弱数据</span>`;
 
   const renderEventRows = (items, emptyText, toneResolver) =>
     items.length
@@ -1544,33 +1588,13 @@ function renderMarketOverview(data) {
         <span>主力净流入</span>
         <strong>${formatMoneyFlow(fundFlow?.main_net_inflow)}${fundFlow?.main_net_inflow_ratio === null || fundFlow?.main_net_inflow_ratio === undefined ? "" : ` · ${formatSignedPercent(fundFlow.main_net_inflow_ratio)}`}</strong>
       </div>
+      ${benchmarkTags}
     </div>
     <article class="overview-note ${sentimentTone}">
       <strong>${escapeHtml(sentiment.summary || "暂无市场结论。")}</strong>
       <small>最新交易日 ${escapeHtml(data.trade_date || "--")} · 5日均值 ${formatMaybeNumber(sentiment.score_avg_5d, 1)} · 较前一日 ${formatSignedNumber(sentiment.score_change_1d, 0)}</small>
     </article>
-    <div class="overview-grid">
-      <section class="overview-block">
-        <div class="overview-block-head">
-          <span>指数强弱</span>
-          <small>1日与5日表现</small>
-        </div>
-        <div class="overview-benchmark-grid">
-          ${benchmarks.length
-            ? benchmarks
-                .map(
-                  (item) => `
-                    <article class="overview-mini-card">
-                      <span>${escapeHtml(item.index_name || item.index_code)}</span>
-                      <strong class="${priceToneClass(item.pct_change)}">${formatSignedPercent(item.pct_change)}</strong>
-                      <small>5日 ${formatSignedDecimalPercent(item.return_5d)}</small>
-                    </article>
-                  `
-                )
-                .join("")
-            : `<div class="placeholder-card overview-placeholder">暂无指数强弱数据。</div>`}
-        </div>
-      </section>
+    <div class="overview-grid overview-grid-triple">
       <section class="overview-block">
         <div class="overview-block-head">
           <span>热点行业</span>
@@ -1598,8 +1622,6 @@ function renderMarketOverview(data) {
             : `<div class="placeholder-card overview-placeholder">暂无行业强度数据。</div>`}
         </div>
       </section>
-    </div>
-    <div class="overview-grid overview-grid-bottom">
       <section class="overview-block">
         <div class="overview-block-head">
           <span>资金流前排</span>
@@ -1764,14 +1786,8 @@ function bindEvents() {
     }
   });
 
-  $("refreshAllBtn").addEventListener("click", () => {
-    refreshDashboard({
-      includeObservationPool: true,
-      includeSelectedStock: true,
-    }).catch(() => null);
-  });
-
   $("syncDailyBtn").addEventListener("click", () => triggerSync(api.syncDaily, "最新日线同步", "daily_kline"));
+  $("syncMissingBtn").addEventListener("click", () => triggerSync(api.syncFullRefresh, "全量补齐更新", "full_refresh"));
 
   document.querySelectorAll("#chartRangeSwitch [data-chart-range]").forEach((button) => {
     button.addEventListener("click", () => {
