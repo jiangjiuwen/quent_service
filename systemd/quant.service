@@ -6,11 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/quant_service_prod/current
-EnvironmentFile=/home/ubuntu/quant_service_prod/prod.env
-ExecStart=/home/ubuntu/quant_service_prod/venv/bin/python /home/ubuntu/quant_service_prod/current/main.py
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/quant_service_prod/current
+EnvironmentFile=/home/deploy/quant_service_prod/prod.env
+ExecStart=/home/deploy/quant_service_prod/venv/bin/python /home/deploy/quant_service_prod/current/main.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

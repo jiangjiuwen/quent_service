@@ -173,6 +173,10 @@ cp .env.example .env
 
 ## GitHub 自动部署腾讯云
 
+完整的腾讯云部署手册见：
+
+- [docs/tencent-cloud-deploy.md](/Users/jiangjiuwen/repos/quant_service/docs/tencent-cloud-deploy.md)
+
 仓库已经补好了 GitHub Actions 部署工作流：
 
 - 工作流文件：`.github/workflows/deploy-tencent-cloud.yml`
@@ -187,25 +191,36 @@ cp .env.example .env
 
 ### 服务器首次准备
 
-以 Ubuntu 为例，先登录腾讯云服务器执行一次：
+如果你的服务器是 OpenCloudOS 9 / RHEL / CentOS 系，直接使用通用 Linux 首装脚本：
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv rsync curl sqlite3
+git clone https://github.com/jiangjiuwen/quent_service.git /home/deploy/quent_service
+cd /home/deploy/quent_service
+sudo bash scripts/bootstrap_tencent_linux.sh --user deploy
 ```
 
-建议使用一个普通登录用户，例如 `ubuntu`，并给它最小够用的免密 `sudo` 权限，因为部署时需要写入 `systemd` 服务并重启服务：
+这个脚本会自动完成：
+
+- 自动识别 `apt` 或 `dnf/yum`
+- 安装 `python3`、`rsync`、`curl`、`git`、`sqlite`/`sqlite3`
+- 创建工作目录和生产目录
+- 配置部署用户的免密 `sudo`
+- 在终端打印出一份可直接照抄的 GitHub Actions 变量清单
+
+如果你的腾讯云机器当前只有 `root` 能登录，可以直接在 `root` 下执行：
 
 ```bash
-echo 'ubuntu ALL=(ALL) NOPASSWD:/usr/bin/systemctl,/bin/systemctl,/usr/bin/install,/bin/install' | sudo tee /etc/sudoers.d/quant-service-deploy
-sudo chmod 440 /etc/sudoers.d/quant-service-deploy
+git clone https://github.com/jiangjiuwen/quent_service.git /root/quent_service
+cd /root/quent_service
+sudo bash scripts/bootstrap_tencent_from_root.sh --user deploy --create-user
 ```
 
-然后确认该用户可以免密执行：
+这个根用户引导脚本会额外完成：
 
-```bash
-sudo -n systemctl status
-```
+- 自动创建部署用户，例如 `deploy`
+- 在 Debian 系加入 `sudo`，在 RHEL 系加入 `wheel`
+- 把当前仓库复制到 `/home/deploy/quent_service`
+- 最后打印出手动首 deploy 和 GitHub Actions 配置的下一步命令
 
 ### GitHub 仓库配置
 
@@ -215,16 +230,20 @@ Repository variables:
 
 - `TENCENT_CVM_HOST`：腾讯云服务器公网 IP 或域名
 - `TENCENT_CVM_PORT`：SSH 端口，默认可填 `22`
-- `TENCENT_CVM_USER`：SSH 登录用户，例如 `ubuntu`
-- `TENCENT_CVM_WORKSPACE`：服务器上的代码同步目录，例如 `/home/ubuntu/quent_service`
-- `QUANT_PROD_ROOT`：生产目录，例如 `/home/ubuntu/quant_service_prod`
+- `TENCENT_CVM_USER`：SSH 登录用户，例如 `deploy`
+- `TENCENT_CVM_WORKSPACE`：服务器上的代码同步目录，例如 `/home/deploy/quent_service`
+- `QUANT_PROD_ROOT`：生产目录，例如 `/home/deploy/quant_service_prod`
 - `QUANT_PROD_API_PORT`：服务端口，例如 `18000`
 - `QUANT_PROD_SERVICE_NAME`：systemd 服务名，例如 `quant-service`
-- `QUANT_PROD_SERVICE_USER`：运行服务的 Linux 用户，例如 `ubuntu`
+- `QUANT_PROD_SERVICE_USER`：运行服务的 Linux 用户，例如 `deploy`
 
 Repository secret:
 
 - `TENCENT_CVM_SSH_KEY`：用于登录腾讯云服务器的私钥内容
+
+仓库里还放了一份示例模板，方便你逐项照着填：
+
+- `docs/tencent-cloud-actions-vars.example`
 
 ### 推荐的 SSH key 配置方式
 
@@ -237,7 +256,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/tencent_quant_deploy -C "github-actions-deploy"
 把公钥追加到服务器目标用户的 `~/.ssh/authorized_keys`：
 
 ```bash
-ssh-copy-id -i ~/.ssh/tencent_quant_deploy.pub ubuntu@your-server-ip
+ssh-copy-id -i ~/.ssh/tencent_quant_deploy.pub deploy@your-server-ip
 ```
 
 再把私钥内容填入 GitHub 的 `TENCENT_CVM_SSH_KEY`：

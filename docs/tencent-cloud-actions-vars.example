@@ -1,0 +1,12 @@
+# GitHub Actions repository variables
+TENCENT_CVM_HOST=<your-server-public-ip>
+TENCENT_CVM_PORT=22
+TENCENT_CVM_USER=deploy
+TENCENT_CVM_WORKSPACE=/home/deploy/quent_service
+QUANT_PROD_ROOT=/home/deploy/quant_service_prod
+QUANT_PROD_API_PORT=18000
+QUANT_PROD_SERVICE_NAME=quant-service
+QUANT_PROD_SERVICE_USER=deploy
+
+# GitHub Actions repository secret
+TENCENT_CVM_SSH_KEY=<paste-private-key-content>
