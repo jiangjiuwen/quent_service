@@ -141,6 +141,18 @@ git push -u origin feat/your-change
 
 如果需要保存部署配置，建议提交脱敏后的示例文件，例如 `.env.example`，不要直接提交真实密钥、生产数据库和日志文件。
 
+仓库现在还包含基础 GitHub Actions 检查流程：
+
+- 推送到 `main` 或向 `main` 发起 Pull Request 时自动执行
+- 检查所有已跟踪 Python 文件的语法
+- 检查前端脚本 `web/assets/app.js` 的语法
+
+如果需要本地环境配置，可以复制一份示例文件再按实际环境修改：
+
+```bash
+cp .env.example .env
+```
+
 ## API接口
 
 ### 基础信息

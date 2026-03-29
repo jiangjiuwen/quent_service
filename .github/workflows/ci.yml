@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check Python syntax
+        shell: bash
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.py')
+          if [ "${#files[@]}" -gt 0 ]; then
+            python -m py_compile "${files[@]}"
+          fi
+
+      - name: Check frontend syntax
+        run: node --check web/assets/app.js
