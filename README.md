@@ -99,6 +99,48 @@ journalctl -u quant -f
 ./scripts/prod_ctl.sh watch-off
 ```
 
+## Git 管理
+
+仓库地址：
+
+```bash
+https://github.com/jiangjiuwen/quent_service.git
+```
+
+推荐使用流程：
+
+```bash
+# 首次克隆
+git clone https://github.com/jiangjiuwen/quent_service.git
+cd quent_service
+
+# 查看当前状态
+git status
+
+# 拉取远端最新代码
+git pull --rebase origin main
+
+# 新建功能分支
+git checkout -b feat/your-change
+
+# 提交改动
+git add .
+git commit -m "feat: describe your change"
+
+# 推送分支
+git push -u origin feat/your-change
+```
+
+当前仓库已经通过 `.gitignore` 排除了这些不应入库的运行态文件：
+
+- 本地数据库文件 `data/*.db`
+- 锁文件 `data/task_locks/*.lock`
+- 日志目录 `logs/`
+- 虚拟环境 `.venv/`
+- Python 缓存与测试产物
+
+如果需要保存部署配置，建议提交脱敏后的示例文件，例如 `.env.example`，不要直接提交真实密钥、生产数据库和日志文件。
+
 ## API接口
 
 ### 基础信息

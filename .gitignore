@@ -6,31 +6,57 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.so
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
 .coverage
+coverage.xml
 htmlcov/
+.ipynb_checkpoints/
 
 # Virtual environments
 .venv/
 venv/
 env/
+.python-version
 
 # Local runtime state
 .tmp/
 test-results/
+*.pid
+*.pid.lock
+*.seed
 
 # Databases and runtime data
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.sqlite3-shm
+data/*.sqlite3-wal
 data/task_locks/*.lock
 
 # Logs
 logs/*.log
 logs/*.out
+logs/*.err
+logs/*.pid
 
 # Editors
 .idea/
 .vscode/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+!.env.example
