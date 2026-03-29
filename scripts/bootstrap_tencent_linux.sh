@@ -131,7 +131,8 @@ install_packages() {
             python3-venv \
             rsync \
             sqlite3 \
-            sudo
+            sudo \
+            zstd
         return 0
     fi
 
@@ -146,7 +147,8 @@ install_packages() {
             python3-pip \
             rsync \
             sqlite \
-            sudo
+            sudo \
+            zstd
         return 0
     fi
 

@@ -202,7 +202,7 @@ sudo bash scripts/bootstrap_tencent_linux.sh --user deploy
 这个脚本会自动完成：
 
 - 自动识别 `apt` 或 `dnf/yum`
-- 安装 `python3`、`rsync`、`curl`、`git`、`sqlite`/`sqlite3`
+- 安装 `python3`、`rsync`、`curl`、`git`、`sqlite`/`sqlite3`、`zstd`
 - 创建工作目录和生产目录
 - 配置部署用户的免密 `sudo`
 - 在终端打印出一份可直接照抄的 GitHub Actions 变量清单

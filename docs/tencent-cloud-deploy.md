@@ -83,7 +83,7 @@ bash scripts/bootstrap_tencent_from_root.sh --user deploy --create-user
 - 创建 `deploy` 用户
 - 在 Debian 系加入 `sudo`，在 RHEL 系加入 `wheel`
 - 安装部署依赖：
-  `git`、`curl`、`python3`、`python3-pip`、`rsync`、`sqlite`/`sqlite3`、`sudo`
+  `git`、`curl`、`python3`、`python3-pip`、`rsync`、`sqlite`/`sqlite3`、`sudo`、`zstd`
 - 创建目录：
   `/home/deploy/quent_service`
   `/home/deploy/quant_service_prod`
@@ -204,6 +204,76 @@ curl http://127.0.0.1:18000/health
 ```
 
 如果返回健康检查结果，说明服务已起来。
+
+### 4.4 迁移本地 SQLite 数据库到服务器
+
+如果你本地已经缓存了大量数据，推荐直接把本地生产库做成一致性快照，再导入服务器，不要在服务运行时直接硬拷 `.db` 主文件。
+
+#### 第一步：在本地导出一致性快照
+
+在你自己的电脑执行：
+
+```bash
+cd /path/to/quent_service
+./scripts/export_prod_db.sh --compress zstd
+```
+
+这个脚本会默认读取本地生产库：
+
+- macOS: `~/Library/Application Support/quant_service_prod/data/a_stock_quant.db`
+- Linux: `~/quant_service_prod/data/a_stock_quant.db`
+
+并完成这些事情：
+
+- 调用 `sqlite3 .backup` 生成一致性快照
+- 执行 `PRAGMA integrity_check`
+- 可选用 `zstd` 压缩成 `.db.zst`
+- 打印最终文件路径和推荐上传命令
+
+#### 第二步：把快照传到服务器
+
+假设导出的文件在 `~/Downloads/`，在本地执行：
+
+```bash
+rsync -avP --partial ~/Downloads/a_stock_quant-*.db.zst deploy@<你的服务器公网IP>:/home/deploy/
+```
+
+如果你导出的是未压缩 `.db` 文件，就把命令里的 `.db.zst` 改成 `.db`。
+
+#### 第三步：在服务器导入数据库
+
+登录服务器后执行：
+
+```bash
+ssh deploy@<你的服务器公网IP>
+cd /home/deploy/quent_service
+./scripts/import_prod_db.sh --source /home/deploy/a_stock_quant-<时间戳>.db.zst
+```
+
+这个脚本会自动：
+
+- 停止生产服务
+- 解压或移动快照到生产目录
+- 执行 `PRAGMA integrity_check`
+- 备份当前服务器数据库
+- 替换为新数据库
+- 重启服务并输出状态
+
+如果你已经跑过首装脚本，服务器上会自动具备 `zstd`，可以直接导入 `.db.zst` 文件。
+
+如果你传的是未压缩 `.db` 文件，命令同理，只要把 `--source` 指向 `.db` 文件即可。
+
+#### 第四步：验证结果
+
+在服务器上执行：
+
+```bash
+cd /home/deploy/quent_service
+./scripts/prod_ctl.sh status
+curl http://127.0.0.1:18000/health
+```
+
+如果你确认迁移成功，再决定是否删除旧备份数据库。
 
 ## 5. 开放腾讯云安全组端口
 
