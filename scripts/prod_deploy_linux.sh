@@ -263,7 +263,9 @@ cleanup_old_releases
 
 echo "生产部署完成"
 echo "平台: Linux systemd"
-echo "API: http://${PROD_API_HOST}:${PROD_API_PORT}"
+echo "监听: ${PROD_API_HOST}:${PROD_API_PORT}"
+echo "本机健康检查: http://127.0.0.1:${PROD_API_PORT}/health"
+echo "外部访问: http://<你的服务器公网IP>:${PROD_API_PORT}"
 echo "服务名: ${PROD_SERVICE_UNIT_NAME}"
 echo "systemctl status ${PROD_SERVICE_UNIT_NAME}"
 echo "journalctl -u ${PROD_SERVICE_UNIT_NAME} -f"
