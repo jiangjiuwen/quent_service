@@ -111,9 +111,19 @@ jobs:
           remote_service_name="${REMOTE_SERVICE_NAME:-quant-service}"
           remote_service_user="${REMOTE_SERVICE_USER:-${DEPLOY_USER}}"
 
-          if [ "\$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-            sudo -n true >/dev/null 2>&1 || {
-              echo "当前部署用户需要免密 sudo，才能写入 systemd 并重启服务" >&2
+          if [ "\$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "当前部署用户缺少 sudo，无法写入 systemd 并重启服务" >&2
+              exit 1
+            fi
+
+            sudo -n systemctl --version >/dev/null 2>&1 || {
+              echo "当前部署用户需要对 systemctl 具备免密 sudo，才能重启服务" >&2
+              exit 1
+            }
+
+            sudo -n install --version >/dev/null 2>&1 || {
+              echo "当前部署用户需要对 install 具备免密 sudo，才能写入 systemd 单元文件" >&2
               exit 1
             }
           fi

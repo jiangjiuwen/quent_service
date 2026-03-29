@@ -471,9 +471,10 @@ cd /home/deploy/quent_service
 
 ```bash
 sudo -u deploy sudo -n systemctl --version
+sudo -u deploy sudo -n install --version
 ```
 
-如果失败，重新执行首装脚本：
+如果这两条里任意一条失败，重新执行首装脚本：
 
 ```bash
 cd /root/quent_service

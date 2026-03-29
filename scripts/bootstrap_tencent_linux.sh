@@ -316,7 +316,8 @@ install -d -o "${DEPLOY_USER}" -g "${DEPLOY_GROUP}" -m 0755 \
 log "Writing sudoers policy for deployment"
 write_sudoers "${DEPLOY_USER}"
 
-log "Validating non-interactive sudo for systemctl"
+log "Validating non-interactive sudo for deployment commands"
 sudo -u "${DEPLOY_USER}" sudo -n systemctl --version >/dev/null
+sudo -u "${DEPLOY_USER}" sudo -n install --version >/dev/null
 
 show_next_steps "${DEPLOY_USER}" "${WORKSPACE_DIR}" "${PROD_ROOT}" "${API_PORT}" "${SERVICE_NAME}"
