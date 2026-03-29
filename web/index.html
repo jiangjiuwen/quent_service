@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>量化数据观察台</title>
+  <meta name="description" content="A股量化数据服务可视化控制台">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <div class="backdrop"></div>
+    <header class="hero reveal">
+      <nav class="topbar">
+        <div class="brand">
+          <div class="brand-mark">Q</div>
+          <div>
+            <p class="brand-kicker">Quant Service</p>
+            <h1>量化数据观察台</h1>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <a class="ghost-button" href="/docs" target="_blank" rel="noreferrer">API 文档</a>
+          <button class="ghost-button" id="refreshAllBtn" type="button">刷新数据</button>
+          <button class="primary-button" id="syncDailyBtn" type="button">同步最新日线</button>
+          <span class="topbar-status" id="actionMessage">自动日更</span>
+        </div>
+      </nav>
+
+      <section class="hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">A-Share Visual Terminal</p>
+          <h2>用一个页面看同步状态、日线走势和技术分析。</h2>
+          <p class="hero-text">
+            首页直接接入服务本身，支持代码/名称搜索、趋势可视化、单股技术面深度分析，以及交易日收盘后的自动日线增量同步。
+          </p>
+        </div>
+
+        <aside class="hero-side panel">
+          <div class="hero-side-header">
+            <div>
+              <p class="panel-kicker">Control Deck</p>
+              <h3>服务与数据总览</h3>
+              <p class="hero-side-copy">总量指标和关键状态集中展示，先看健康度与同步结果，再看库内规模。</p>
+            </div>
+            <div class="hero-side-status">
+              <div class="meta-chip hero-side-status-chip">
+                <span class="meta-chip-label">运行状态</span>
+                <strong id="healthText">检查中</strong>
+              </div>
+              <div class="meta-chip hero-side-status-chip">
+                <span class="meta-chip-label">日线同步</span>
+                <strong id="dailySyncStatus">-</strong>
+                <small id="dailySyncTime">等待数据</small>
+              </div>
+              <div class="meta-chip hero-side-status-chip">
+                <span class="meta-chip-label">运行任务</span>
+                <strong id="runningTaskSummary">当前空闲</strong>
+              </div>
+            </div>
+          </div>
+
+          <section class="hero-side-section">
+            <div class="hero-side-section-head">
+              <div>
+                <p class="hero-side-section-label">Inventory</p>
+                <h4>当前库规模</h4>
+              </div>
+              <span class="hero-side-section-note">总量信息单独看</span>
+            </div>
+            <div class="metric-grid metric-grid-secondary">
+              <article class="metric-card metric-card-compact">
+                <span>股票池</span>
+                <strong id="stockCount">-</strong>
+                <small id="stockCountNote">总 / 活跃 / 非活跃</small>
+              </article>
+              <article class="metric-card metric-card-compact">
+                <span>指数池</span>
+                <strong id="indexCount">-</strong>
+                <small>独立指数记录</small>
+              </article>
+              <article class="metric-card metric-card-compact">
+                <span>日线记录</span>
+                <strong id="klineCount">-</strong>
+                <small id="klineCountNote">当前库内行情条数</small>
+              </article>
+              <article class="metric-card metric-card-compact">
+                <span>运行任务</span>
+                <strong id="runningTaskCount">-</strong>
+                <small>后台执行中的任务</small>
+              </article>
+            </div>
+          </section>
+
+        </aside>
+      </section>
+
+    </header>
+
+    <main class="dashboard">
+      <section class="main-column">
+        <section class="panel chart-panel reveal">
+          <div class="chart-search-stack">
+            <form class="search-form" id="searchForm">
+              <label class="search-box" for="searchInput">
+                <span class="search-label">定位股票</span>
+                <input id="searchInput" name="search" autocomplete="off" placeholder="输入代码或名称，例如 000001 / 平安银行">
+              </label>
+              <button class="primary-button" type="submit">查看</button>
+            </form>
+
+            <div class="suggestions" id="suggestions" hidden></div>
+          </div>
+
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">趋势雷达</p>
+              <h3 id="stockTitle">载入中</h3>
+              <p id="stockSubtitle" class="muted">正在读取股票基本信息</p>
+            </div>
+            <div class="price-badge" id="priceBadge">
+              <span class="price-badge-label">最新价</span>
+              <strong id="latestPrice">-</strong>
+              <small id="latestChange">等待数据</small>
+            </div>
+          </div>
+
+          <div class="chart-stats">
+            <div class="stat-tile">
+              <span>已载入区间</span>
+              <strong id="loadedRange">-</strong>
+              <small id="loadedBars">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>最新交易日</span>
+              <strong id="latestTradeDate">-</strong>
+              <small id="latestSessionStatus">最新可视交易日</small>
+            </div>
+            <div class="stat-tile">
+              <span>当前窗口涨跌</span>
+              <strong id="windowReturn">-</strong>
+              <small id="windowRangeNote">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>当前窗口高低</span>
+              <strong id="rangeSpan">-</strong>
+              <small id="rangeSpanNote">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>近52周高</span>
+              <strong id="yearHigh">-</strong>
+              <small id="yearHighDate">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>近52周低</span>
+              <strong id="yearLow">-</strong>
+              <small id="yearLowDate">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>最近成交量</span>
+              <strong id="latestVolume">-</strong>
+              <small id="latestTurnover">-</small>
+            </div>
+            <div class="stat-tile">
+              <span>最近成交额</span>
+              <strong id="latestAmount">-</strong>
+              <small id="latestValuation">-</small>
+            </div>
+          </div>
+
+          <div class="chart-toolbar">
+            <div class="range-switch" id="chartRangeSwitch" aria-label="K线区间切换">
+              <button class="range-button" type="button" data-chart-range="60">3月</button>
+              <button class="range-button" type="button" data-chart-range="250">1年</button>
+              <button class="range-button active" type="button" data-chart-range="750">3年</button>
+              <button class="range-button" type="button" data-chart-range="1250">5年</button>
+              <button class="range-button" type="button" data-chart-range="3750">15年</button>
+              <button class="range-button" type="button" data-chart-range="all">全部</button>
+            </div>
+
+            <div class="chart-legend">
+              <span class="legend-item"><span class="legend-swatch legend-up"></span>K线</span>
+              <span class="legend-item"><span class="legend-swatch legend-volume"></span>成交量</span>
+              <span class="legend-item"><span class="legend-swatch legend-ma5"></span>MA5 <strong id="ma5Value">-</strong></span>
+              <span class="legend-item"><span class="legend-swatch legend-ma10"></span>MA10 <strong id="ma10Value">-</strong></span>
+              <span class="legend-item"><span class="legend-swatch legend-ma20"></span>MA20 <strong id="ma20Value">-</strong></span>
+            </div>
+          </div>
+
+          <div class="chart-wrap">
+            <div id="priceChart" class="chart-canvas" aria-label="专业交互式K线图"></div>
+            <p class="chart-attribution">
+              Chart engine:
+              <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView Lightweight Charts 5.1.0</a>
+            </p>
+            <div class="chart-empty" id="chartEmpty" hidden>该股票暂无日线数据。</div>
+          </div>
+
+          <div class="chart-detail-grid">
+            <article class="chart-detail-card">
+              <span>焦点日期</span>
+              <strong id="chartFocusDate">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>开盘 / 前收</span>
+              <strong id="chartFocusOpenPrev">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>收盘 / 涨跌</span>
+              <strong id="chartFocusCloseChange">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>日内高低</span>
+              <strong id="chartFocusHighLow">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>振幅 / 换手</span>
+              <strong id="chartFocusAmplitudeTurnover">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>成交量</span>
+              <strong id="chartFocusVolume">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>成交额</span>
+              <strong id="chartFocusAmount">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>PE / PB</span>
+              <strong id="chartFocusValuation">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>MA5 / MA10</span>
+              <strong id="chartFocusMAFast">-</strong>
+            </article>
+            <article class="chart-detail-card">
+              <span>MA20 / 窗口位置</span>
+              <strong id="chartFocusMASlow">-</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel technical-panel reveal">
+          <div class="panel-header compact">
+            <div>
+              <p class="panel-kicker">Technical</p>
+              <h3 id="technicalTitle">000001 技术面深度分析</h3>
+            </div>
+          </div>
+          <div id="technicalAnalysis" class="technical-analysis">
+            <div class="placeholder-card">技术面分析加载中。</div>
+          </div>
+        </section>
+      </section>
+
+      <aside class="side-column">
+        <section class="panel watchlist-panel reveal">
+          <div class="panel-header compact">
+            <div>
+              <p class="panel-kicker">机会池</p>
+              <h3>一周内短线机会列表</h3>
+            </div>
+          </div>
+          <div id="watchlist" class="watchlist"></div>
+        </section>
+
+        <section class="panel financial-panel reveal">
+          <div class="panel-header compact">
+            <div>
+              <p class="panel-kicker">Scorecard</p>
+              <h3 id="financialTitle">000001 短线机会评分</h3>
+            </div>
+          </div>
+          <div id="financialSummary" class="financial-summary">
+            <div class="placeholder-card">短线机会评分加载中。</div>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

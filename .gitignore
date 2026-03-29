@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime state
+.tmp/
+test-results/
+
+# Databases and runtime data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/task_locks/*.lock
+
+# Logs
+logs/*.log
+logs/*.out
+
+# Editors
+.idea/
+.vscode/
