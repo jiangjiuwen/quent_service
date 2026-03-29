@@ -36,7 +36,7 @@ quant_service/
 ### 1. 安装依赖
 
 ```bash
-cd /root/quant_service
+cd /path/to/quent_service
 pip install -r requirements.txt
 ```
 
@@ -50,34 +50,32 @@ pip install -r requirements.txt
 
 ```bash
 # 查看状态
-systemctl status quant
-
-# 启动服务
-systemctl start quant
-
-# 停止服务
-systemctl stop quant
+./scripts/prod_ctl.sh status
 
 # 重启服务
-systemctl restart quant
+./scripts/prod_ctl.sh restart
 
 # 查看日志
-journalctl -u quant -f
+./scripts/prod_ctl.sh logs
 ```
 
-## macOS 常驻生产服务
+## 跨平台生产部署
 
-本项目现在支持在 macOS 上以 `launchd` 常驻运行，并与本地开发环境隔离：
+本项目现在支持 macOS 和 Linux 两套生产部署方式，并且统一使用同一组命令：
 
-- 生产代码快照目录：`~/Library/Application Support/quant_service_prod/current`
-- 生产数据库目录：`~/Library/Application Support/quant_service_prod/data`
-- 生产日志目录：`~/Library/Application Support/quant_service_prod/logs`
-- 生产端口：`18000`
+- `./deploy.sh`
+- `./scripts/prod_deploy.sh`
+- `./scripts/prod_ctl.sh <command>`
 
-首次部署并启动历史回填：
+脚本会自动识别当前系统：
+
+- macOS 使用 `launchd`
+- Linux 使用 `systemd`
+
+首次部署：
 
 ```bash
-./scripts/prod_deploy.sh --start-backfill
+./scripts/prod_deploy.sh
 ```
 
 常用管理命令：
@@ -86,18 +84,38 @@ journalctl -u quant -f
 # 查看生产状态
 ./scripts/prod_ctl.sh status
 
-# 手动更新生产版本
+# 启动生产服务
+./scripts/prod_ctl.sh start
+
+# 停止生产服务
+./scripts/prod_ctl.sh stop
+
+# 重启生产服务
+./scripts/prod_ctl.sh restart
+
+# 查看日志
+./scripts/prod_ctl.sh logs
+
+# 重新部署当前代码
 ./scripts/prod_ctl.sh deploy
-
-# 手动启动历史回填
-./scripts/prod_ctl.sh backfill-start
-
-# 开启代码变更自动部署
-./scripts/prod_ctl.sh watch-on
-
-# 关闭代码变更自动部署
-./scripts/prod_ctl.sh watch-off
 ```
+
+macOS 额外支持代码变更自动部署监听：
+
+```bash
+./scripts/prod_ctl.sh watch-on
+./scripts/prod_ctl.sh watch-off
+./scripts/prod_ctl.sh watch-status
+```
+
+默认生产目录：
+
+- 生产代码快照目录：`~/Library/Application Support/quant_service_prod/current`
+- 生产数据库目录：`~/Library/Application Support/quant_service_prod/data`
+- 生产日志目录：`~/Library/Application Support/quant_service_prod/logs`
+- 生产端口：`18000`
+- Linux 生产根目录默认是 `~/quant_service_prod`
+- Linux 首次部署会自动写入 `systemd` 服务；如果当前用户不是 root，脚本会在需要时调用 `sudo`
 
 ## Git 管理
 
@@ -152,6 +170,96 @@ git push -u origin feat/your-change
 ```bash
 cp .env.example .env
 ```
+
+## GitHub 自动部署腾讯云
+
+仓库已经补好了 GitHub Actions 部署工作流：
+
+- 工作流文件：`.github/workflows/deploy-tencent-cloud.yml`
+- 触发方式：推送到 `main`，或手动执行 `workflow_dispatch`
+- 部署方式：GitHub Actions 通过 `SSH + rsync` 将当前代码同步到腾讯云 Linux 服务器，然后在服务器上执行 `./scripts/prod_deploy.sh`
+
+这样做的好处是：
+
+- 服务器不需要再单独配置 GitHub 拉取权限
+- 部署的就是当前 GitHub 里的提交内容
+- 仍然复用项目现有的 Linux `systemd` 部署脚本
+
+### 服务器首次准备
+
+以 Ubuntu 为例，先登录腾讯云服务器执行一次：
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv rsync curl sqlite3
+```
+
+建议使用一个普通登录用户，例如 `ubuntu`，并给它最小够用的免密 `sudo` 权限，因为部署时需要写入 `systemd` 服务并重启服务：
+
+```bash
+echo 'ubuntu ALL=(ALL) NOPASSWD:/usr/bin/systemctl,/bin/systemctl,/usr/bin/install,/bin/install' | sudo tee /etc/sudoers.d/quant-service-deploy
+sudo chmod 440 /etc/sudoers.d/quant-service-deploy
+```
+
+然后确认该用户可以免密执行：
+
+```bash
+sudo -n systemctl status
+```
+
+### GitHub 仓库配置
+
+在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 中新增：
+
+Repository variables:
+
+- `TENCENT_CVM_HOST`：腾讯云服务器公网 IP 或域名
+- `TENCENT_CVM_PORT`：SSH 端口，默认可填 `22`
+- `TENCENT_CVM_USER`：SSH 登录用户，例如 `ubuntu`
+- `TENCENT_CVM_WORKSPACE`：服务器上的代码同步目录，例如 `/home/ubuntu/quent_service`
+- `QUANT_PROD_ROOT`：生产目录，例如 `/home/ubuntu/quant_service_prod`
+- `QUANT_PROD_API_PORT`：服务端口，例如 `18000`
+- `QUANT_PROD_SERVICE_NAME`：systemd 服务名，例如 `quant-service`
+- `QUANT_PROD_SERVICE_USER`：运行服务的 Linux 用户，例如 `ubuntu`
+
+Repository secret:
+
+- `TENCENT_CVM_SSH_KEY`：用于登录腾讯云服务器的私钥内容
+
+### 推荐的 SSH key 配置方式
+
+在本地生成一个单独用于部署的密钥对：
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/tencent_quant_deploy -C "github-actions-deploy"
+```
+
+把公钥追加到服务器目标用户的 `~/.ssh/authorized_keys`：
+
+```bash
+ssh-copy-id -i ~/.ssh/tencent_quant_deploy.pub ubuntu@your-server-ip
+```
+
+再把私钥内容填入 GitHub 的 `TENCENT_CVM_SSH_KEY`：
+
+```bash
+cat ~/.ssh/tencent_quant_deploy
+```
+
+### 部署触发
+
+完成以上配置后，后续只要推送到 `main`：
+
+```bash
+git push origin main
+```
+
+GitHub Actions 就会自动：
+
+- 连接腾讯云服务器
+- 同步当前仓库代码
+- 执行 `./scripts/prod_deploy.sh`
+- 输出 `./scripts/prod_ctl.sh status` 的结果
 
 ## API接口
 

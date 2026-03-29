@@ -1,0 +1,134 @@
+name: Deploy Tencent Cloud
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-tencent-cloud
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ vars.TENCENT_CVM_HOST }}
+      DEPLOY_PORT: ${{ vars.TENCENT_CVM_PORT }}
+      DEPLOY_USER: ${{ vars.TENCENT_CVM_USER }}
+      DEPLOY_WORKSPACE: ${{ vars.TENCENT_CVM_WORKSPACE }}
+      REMOTE_PROD_ROOT: ${{ vars.QUANT_PROD_ROOT }}
+      REMOTE_API_PORT: ${{ vars.QUANT_PROD_API_PORT }}
+      REMOTE_SERVICE_NAME: ${{ vars.QUANT_PROD_SERVICE_NAME }}
+      REMOTE_SERVICE_USER: ${{ vars.QUANT_PROD_SERVICE_USER }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment settings
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TENCENT_CVM_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [ -n "${DEPLOY_HOST}" ] || missing+=("TENCENT_CVM_HOST")
+          [ -n "${DEPLOY_USER}" ] || missing+=("TENCENT_CVM_USER")
+          [ -n "${SSH_PRIVATE_KEY}" ] || missing+=("TENCENT_CVM_SSH_KEY")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing GitHub repository settings: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TENCENT_CVM_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deploy_port="${DEPLOY_PORT:-22}"
+          mkdir -p "${HOME}/.ssh"
+          chmod 700 "${HOME}/.ssh"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" | tr -d '\r' > "${HOME}/.ssh/tencent_cvm"
+          chmod 600 "${HOME}/.ssh/tencent_cvm"
+          ssh-keyscan -p "${deploy_port}" -H "${DEPLOY_HOST}" >> "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+
+      - name: Prepare remote workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deploy_port="${DEPLOY_PORT:-22}"
+          remote_workspace="${DEPLOY_WORKSPACE:-~/quent_service}"
+
+          ssh -i "${HOME}/.ssh/tencent_cvm" -p "${deploy_port}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "mkdir -p ${remote_workspace}"
+
+      - name: Sync repository to server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deploy_port="${DEPLOY_PORT:-22}"
+          remote_workspace="${DEPLOY_WORKSPACE:-~/quent_service}"
+
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.venv/' \
+            --exclude 'data/' \
+            --exclude 'logs/' \
+            --exclude '__pycache__/' \
+            --exclude '.pytest_cache/' \
+            --exclude '.mypy_cache/' \
+            --exclude '.ruff_cache/' \
+            --exclude '.DS_Store' \
+            -e "ssh -i ${HOME}/.ssh/tencent_cvm -p ${deploy_port}" \
+            ./ "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_workspace}/"
+
+      - name: Deploy on server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deploy_port="${DEPLOY_PORT:-22}"
+
+          ssh -i "${HOME}/.ssh/tencent_cvm" -p "${deploy_port}" "${DEPLOY_USER}@${DEPLOY_HOST}" /bin/bash <<EOF
+          set -euo pipefail
+
+          deploy_workspace="${DEPLOY_WORKSPACE:-\$HOME/quent_service}"
+          remote_prod_root="${REMOTE_PROD_ROOT:-\$HOME/quant_service_prod}"
+          remote_api_port="${REMOTE_API_PORT:-18000}"
+          remote_service_name="${REMOTE_SERVICE_NAME:-quant-service}"
+          remote_service_user="${REMOTE_SERVICE_USER:-${DEPLOY_USER}}"
+
+          if [ "\$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            sudo -n true >/dev/null 2>&1 || {
+              echo "当前部署用户需要免密 sudo，才能写入 systemd 并重启服务" >&2
+              exit 1
+            }
+          fi
+
+          cd "\${deploy_workspace}"
+
+          QUANT_PROD_ROOT="\${remote_prod_root}" \
+          QUANT_PROD_API_PORT="\${remote_api_port}" \
+          QUANT_PROD_SERVICE_NAME="\${remote_service_name}" \
+          QUANT_PROD_SERVICE_USER="\${remote_service_user}" \
+          bash ./scripts/prod_deploy.sh
+
+          QUANT_PROD_ROOT="\${remote_prod_root}" \
+          QUANT_PROD_API_PORT="\${remote_api_port}" \
+          QUANT_PROD_SERVICE_NAME="\${remote_service_name}" \
+          QUANT_PROD_SERVICE_USER="\${remote_service_user}" \
+          bash ./scripts/prod_ctl.sh status
+          EOF
