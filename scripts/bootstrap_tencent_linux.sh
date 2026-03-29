@@ -211,9 +211,24 @@ TENCENT_CVM_SSH_KEY=<paste-private-key-content>
 Recommended SSH setup:
 1. Generate a dedicated deploy key locally:
    ssh-keygen -t ed25519 -f ~/.ssh/tencent_quant_deploy -C "github-actions-deploy"
-2. Install the public key on the server:
-   ssh-copy-id -i ~/.ssh/tencent_quant_deploy.pub ${deploy_user}@<your-server-public-ip>
-3. Copy the private key content into GitHub secret TENCENT_CVM_SSH_KEY:
+2. Add these entries to your local ~/.ssh/config:
+   Host root
+     HostName <your-server-public-ip>
+     User root
+     Port 22
+
+   Host deploy
+     HostName <your-server-public-ip>
+     User ${deploy_user}
+     Port 22
+     IdentityFile ~/.ssh/tencent_quant_deploy
+     IdentitiesOnly yes
+3. Install the public key into /home/${deploy_user}/.ssh/authorized_keys on the server.
+4. For all later SSH / rsync commands, use:
+   ssh root
+   ssh deploy
+   rsync ... deploy:/home/${deploy_user}/
+5. Copy the private key content into GitHub secret TENCENT_CVM_SSH_KEY:
    cat ~/.ssh/tencent_quant_deploy
 EOF
 }

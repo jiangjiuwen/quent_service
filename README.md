@@ -245,7 +245,7 @@ Repository secret:
 
 - `docs/tencent-cloud-actions-vars.example`
 
-### 推荐的 SSH key 配置方式
+### 推荐的 SSH 配置方式
 
 在本地生成一个单独用于部署的密钥对：
 
@@ -253,10 +253,50 @@ Repository secret:
 ssh-keygen -t ed25519 -f ~/.ssh/tencent_quant_deploy -C "github-actions-deploy"
 ```
 
-把公钥追加到服务器目标用户的 `~/.ssh/authorized_keys`：
+然后修改本地 `~/.ssh/config`，后续所有登录和传输都走固定别名：
 
 ```bash
-ssh-copy-id -i ~/.ssh/tencent_quant_deploy.pub deploy@your-server-ip
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+cat >> ~/.ssh/config <<'EOF'
+Host root
+  HostName your-server-ip
+  User root
+  Port 22
+
+Host deploy
+  HostName your-server-ip
+  User deploy
+  Port 22
+  IdentityFile ~/.ssh/tencent_quant_deploy
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+```
+
+推荐直接在服务器当前会话中，把公钥追加到目标用户的 `~/.ssh/authorized_keys`：
+
+```bash
+cat ~/.ssh/tencent_quant_deploy.pub
+```
+
+然后在服务器上执行：
+
+```bash
+mkdir -p /home/deploy/.ssh
+chmod 700 /home/deploy/.ssh
+echo "<把公钥整行粘贴到这里>" >> /home/deploy/.ssh/authorized_keys
+chmod 600 /home/deploy/.ssh/authorized_keys
+chown -R deploy:deploy /home/deploy/.ssh
+restorecon -Rv /home/deploy/.ssh 2>/dev/null || true
+```
+
+后续所有登录和文件传输都统一按 `~/.ssh/config` 里的别名执行：
+
+```bash
+ssh root
+ssh deploy
+rsync ... deploy:/home/deploy/
 ```
 
 再把私钥内容填入 GitHub 的 `TENCENT_CVM_SSH_KEY`：
